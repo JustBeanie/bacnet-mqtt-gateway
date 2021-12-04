@@ -13,6 +13,7 @@ For BACnet connection the [Node BACstack](https://github.com/fh1ch/node-bacstack
 
 ## Getting started
 
+
 1. Clone repo and install npm dependencies:
 
     ```shell
@@ -20,6 +21,18 @@ For BACnet connection the [Node BACstack](https://github.com/fh1ch/node-bacstack
     cd bacnet-mqtt-gateway
     npm install
     ```
+
+## Run with Docker
+
+Gateway can also be run as a docker container. Just build the image and start a container:
+
+```shell
+docker build -t bacnet-mqtt-gateway .
+docker run -p 8082:8082 -v /mnt/bacnet-gateway/devices:/usr/src/app/devices -v /mnt/bacnet-gateway/config:/usr/src/app/config bacnet-mqtt-gateway
+```
+
+With the specified file mountings you can put the config file under `/mnt/bacnet-gateway/config` and the device configs under `/mnt/bacnet-gateway/devices` on the host system.
+
 
 2. Configure gateway:
 
@@ -142,14 +155,3 @@ The following endpoints are supported:
         }]
     }
     ```
-
-## Run with Docker
-
-Gateway can also be run as a docker container. Just build the image and start a container:
-
-```shell
-docker build -t bacnet-mqtt-gateway
-docker run -p 8082:8082 -v /mnt/bacnet-gateway/devices:/usr/src/app/devices -v /mnt/bacnet-gateway/config:/usr/src/app/config bacnet-mqtt-gateway
-```
-
-With the specified file mountings you can put the config file under `/mnt/bacnet-gateway/config` and the device configs under `/mnt/bacnet-gateway/devices` on the host system.
