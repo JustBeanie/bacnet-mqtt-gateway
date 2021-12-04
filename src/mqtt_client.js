@@ -10,9 +10,9 @@ const host = config.get('mqtt.host');
 const port = config.get('mqtt.port');
 const certPath = config.get('mqtt.authentication.certPath');
 const keyPath = config.get('mqtt.authentication.keyPath');
-const user = config.get('mqtt.user');
-const pass = config.get('mqtt.pass');
-const keyauth = config.get('mqqtt.keyauth');
+const user = config.get('mqtt.authentication.user');
+const pass = config.get('mqtt.authentication.pass');
+const keyauth = config.get('mqtt.keyauth');
 
 
 class MqttClient extends EventEmitter {
