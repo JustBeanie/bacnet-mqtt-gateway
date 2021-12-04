@@ -28,6 +28,13 @@ if (httpServerEnabled) {
     new Server(bacnetClient);
 }
 
+// Handle SIGINT exit
+process.stdin.resume();
+process.on('SIGINT', function () {
+  console.log('Interrupted');
+  process.exit();
+});
+
 // some default init logic when starting the gateway
 function init() {
 

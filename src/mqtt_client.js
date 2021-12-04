@@ -10,21 +10,35 @@ const host = config.get('mqtt.host');
 const port = config.get('mqtt.port');
 const certPath = config.get('mqtt.authentication.certPath');
 const keyPath = config.get('mqtt.authentication.keyPath');
+const user = config.get('mqtt.user');
+const pass = config.get('mqtt.pass');
+const keyauth = config.get('mqqtt.keyauth');
+
 
 class MqttClient extends EventEmitter {
 
     constructor() {
         super();
-
-        var options = {
-            host: host,
-            port: port,
-            protocol: 'mqtts',
-            cert: fs.readFileSync(certPath),
-            key: fs.readFileSync(keyPath),
-            rejectUnauthorized: false
+        if (keyauth === true)
+        {
+            var options = {
+                host: host,
+                port: port,
+                protocol: mqtts,
+                cert: fs.readFileSync(certPath),
+                key: fs.readFileSync(keyPath),
+                rejectUnauthorized: false
+            }
+        }else{
+            var options = {
+                host: host,
+                port: port,
+                protocol: mqtt,
+                username: user,
+                password: pass,
+                rejectUnauthorized: false
+            }
         }
-
         this.client = mqtt.connect(options);
         this.client.on('connect', () => {
             this._onConnect();
