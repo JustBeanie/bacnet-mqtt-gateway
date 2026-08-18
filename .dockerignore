@@ -1,2 +1,12 @@
+.git
+.github
+.vscode
 node_modules
-npm-debug.log
+coverage
+__tests__
+test-fixtures
+*.log
+npm-debug.log*
+.env
+.env.*
+UPSTREAM_CHANGELOG.md
