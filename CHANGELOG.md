@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.0.1
+
+- Take ownership of the application source, tests, and container build from
+  `JustBeanie/ha-addons`, which previously carried a byte-identical copy of this
+  tree.
+- Add CI on `master` running the Jest suite with its coverage gate on Node 22
+  and 24, plus a dependency audit.
+- Add a tag-triggered release workflow publishing
+  `ghcr.io/justbeanie/bacnet-mqtt-gateway-amd64` and `-aarch64`, built on native
+  runners rather than QEMU emulation.
+- Move the Home Assistant app manifest, options schema, translations, AppArmor
+  profile, and user documentation to `JustBeanie/ha-addons`, which now installs
+  the published image instead of building one on the Home Assistant host.
+- Point `org.opencontainers.image.source` and `package.json` `repository` at
+  this repository so the published packages link back to the build that
+  produced them.
+
 ## 2.0.0
 
 - Add native Home Assistant OS/Supervisor app packaging for `amd64` and

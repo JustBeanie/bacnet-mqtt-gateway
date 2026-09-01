@@ -1,6 +1,6 @@
 FROM ghcr.io/home-assistant/base:3.22
 
-ARG BUILD_VERSION=2.0.0
+ARG BUILD_VERSION=2.0.1
 ARG BUILD_ARCH
 
 ENV NODE_ENV=production \
@@ -41,7 +41,7 @@ LABEL \
     io.hass.arch="${BUILD_ARCH}" \
     org.opencontainers.image.title="BACnet MQTT Gateway" \
     org.opencontainers.image.description="BACnet/IP to MQTT gateway for Home Assistant" \
-    org.opencontainers.image.source="https://github.com/JustBeanie/ha-addons" \
+    org.opencontainers.image.source="https://github.com/JustBeanie/bacnet-mqtt-gateway" \
     org.opencontainers.image.licenses="Apache-2.0" \
     org.opencontainers.image.version="${BUILD_VERSION}"
 

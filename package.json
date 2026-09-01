@@ -1,6 +1,6 @@
 {
   "name": "bacnet-mqtt-gateway",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Home Assistant OS app for the production BACnet to MQTT gateway",
   "main": "src/app.js",
   "scripts": {
@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/JustBeanie/ha-addons.git"
+    "url": "git+https://github.com/JustBeanie/bacnet-mqtt-gateway.git"
   },
   "author": "Beanie",
   "contributors": [
@@ -21,8 +21,7 @@
   "upstream": {
     "repository": "https://github.com/novatechflow/bacnet-mqtt-gateway",
     "commit": "6e4aed4cd326e6feb938e316a37109f6e108b34e",
-    "requestedFork": "https://github.com/JustBeanie/bacnet-mqtt-gateway",
-    "requestedForkCommit": "093ad0d842ebf0ae07942edfba37171b8de8f366"
+    "forkBaseCommit": "093ad0d842ebf0ae07942edfba37171b8de8f366"
   },
   "license": "Apache-2.0",
   "dependencies": {
