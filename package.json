@@ -1,6 +1,6 @@
 {
   "name": "bacnet-mqtt-gateway",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Home Assistant OS app for the production BACnet to MQTT gateway",
   "main": "src/app.js",
   "scripts": {

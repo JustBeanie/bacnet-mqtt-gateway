@@ -1,6 +1,6 @@
 FROM ghcr.io/home-assistant/base:3.22
 
-ARG BUILD_VERSION=2.0.1
+ARG BUILD_VERSION=2.0.2
 ARG BUILD_ARCH
 
 ENV NODE_ENV=production \
@@ -44,5 +44,12 @@ LABEL \
     org.opencontainers.image.source="https://github.com/JustBeanie/bacnet-mqtt-gateway" \
     org.opencontainers.image.licenses="Apache-2.0" \
     org.opencontainers.image.version="${BUILD_VERSION}"
+
+# Replaces the manifest's obsolete `watchdog:` key. server.js exempts loopback
+# requests to /health from the ingress source restriction for exactly this, and
+# the endpoint answers 200 whenever the process is serving, so this probe means
+# "the listener is up" - the same thing the Supervisor watchdog checked.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["node", "-e", "require('http').get('http://127.0.0.1:18082/health',(r)=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
 
 CMD ["/run.sh"]

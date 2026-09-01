@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.0.2
+
+- Replace the app manifest's obsolete `watchdog:` key with a Docker
+  `HEALTHCHECK` probing `/health` over loopback, which the server already
+  exempts from its ingress source restriction. The Home Assistant app linter
+  rejects `watchdog:`, and this repository owns the Dockerfile it moves into.
+
 ## 2.0.1
 
 - Take ownership of the application source, tests, and container build from
