@@ -20,7 +20,7 @@
   ],
   "upstream": {
     "repository": "https://github.com/novatechflow/bacnet-mqtt-gateway",
-    "commit": "6e4aed4cd326e6feb938e316a37109f6e108b34e",
+    "commit": "b4ff75c059a3d43a702defc08dbd5775ad2fc436",
     "forkBaseCommit": "093ad0d842ebf0ae07942edfba37171b8de8f366"
   },
   "license": "Apache-2.0",
@@ -35,7 +35,7 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": ">=5.2.1",
-    "express-rate-limit": "^8.6.1",
+    "express-rate-limit": "^8.7.0",
     "glob-parent": ">=6.0.2",
     "jsonwebtoken": "^9.0.3",
     "mqtt": ">=5.15.2",
@@ -61,7 +61,7 @@
     "smartbuilding"
   ],
   "devDependencies": {
-    "jest": "^30.4.2"
+    "jest": "^30.5.0"
   },
   "overrides": {
     "tar": "7.5.22",
