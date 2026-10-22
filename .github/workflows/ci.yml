@@ -22,8 +22,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Node 24 is what the home-assistant/base image installs. Node 22 is
+        # gone because config 5 loads an .mjs entry through require(), which
+        # Jest's CommonJS runtime only supports from Node 24.9; the app itself
+        # still runs on Node 20.19+.
         node:
-          - 22
           - 24
     steps:
       - name: Check out repository
