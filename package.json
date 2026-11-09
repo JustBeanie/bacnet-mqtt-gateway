@@ -66,7 +66,9 @@
     "brace-expansion": "5.0.12",
     "js-yaml": "3.15.2",
     "picomatch": "4.0.4",
-    "baseline-browser-mapping": "2.11.0"
+    "baseline-browser-mapping": "2.11.0",
+    "glob": "14.0.4",
+    "minimatch": "11.0.5"
   },
   "jest": {
     "testEnvironment": "node",
