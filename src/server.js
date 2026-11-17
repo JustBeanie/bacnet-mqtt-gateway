@@ -155,6 +155,14 @@ class Server {
     }
 
     _mountVendorAssets() {
+        const assetLimiter = rateLimit({
+            windowMs: 60 * 1000,
+            max: 120,
+            store: this._createRateLimitStore(),
+            standardHeaders: true,
+            legacyHeaders: false,
+            keyGenerator: (req) => this._rateLimitKey(req)
+        });
         const assets = [
             ['vue.global.prod.js', resolvePackageAsset('vue', 'dist/vue.global.prod.js')],
             ['axios.min.js', resolvePackageAsset('axios', 'dist/axios.min.js')],
@@ -173,8 +181,8 @@ class Server {
                     }
                 });
             };
-            this.app.get(`/vendor/${publicName}`, serveAsset);
-            this.app.get(`/admin/vendor/${publicName}`, serveAsset);
+            this.app.get(`/vendor/${publicName}`, assetLimiter, serveAsset);
+            this.app.get(`/admin/vendor/${publicName}`, assetLimiter, serveAsset);
         }
     }
 

@@ -88,6 +88,29 @@ describe('Server helper methods', () => {
         expressApp.listen.mock.calls[0][1]();
     });
 
+    test('both vendor prefixes share a limiter separate from the API limiter', () => {
+        new Server({}, {}, {});
+
+        const vendorRoutes = expressApp.get.mock.calls.filter(([route]) => route.includes('/vendor/'));
+        const vendorPaths = [
+            '/vendor/vue.global.prod.js',
+            '/vendor/axios.min.js',
+            '/vendor/bootstrap.min.css'
+        ];
+        expect(vendorRoutes.map(([route]) => route).sort()).toEqual(
+            vendorPaths.flatMap((route) => [route, `/admin${route}`]).sort()
+        );
+
+        const [, assetLimiter] = vendorRoutes[0];
+        const [, apiLimiter] = expressApp.get.mock.calls.find(([route]) => route === '/api/bacnet/runtime');
+        expect(assetLimiter).toEqual(expect.any(Function));
+        expect(assetLimiter).not.toBe(apiLimiter);
+        for (const [, limiter, handler] of vendorRoutes) {
+            expect(limiter).toBe(assetLimiter);
+            expect(handler).toEqual(expect.any(Function));
+        }
+    });
+
     test('buildOpenApiDocument uses configured server URL when provided', () => {
         const { buildOpenApiDocument } = require('../src/server');
         const spec = buildOpenApiDocument({
