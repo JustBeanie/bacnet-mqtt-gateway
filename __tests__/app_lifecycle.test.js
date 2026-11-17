@@ -257,4 +257,30 @@ describe('process lifecycle handlers', () => {
         expect(application.shutdown).toHaveBeenCalledWith('initialization failure');
         expect(processRef.exit).toHaveBeenCalledWith(1);
     });
+    test('shutdown waits for an in-progress admin seed and delivers its password once', async () => {
+        const { bacnetClient, mqttClient } = createClients();
+        let finishSeed;
+        const authService = {
+            init: jest.fn(() => new Promise((resolve) => { finishSeed = resolve; })),
+            close: jest.fn().mockResolvedValue()
+        };
+        const deliverInitialAdminPassword = jest.fn();
+        const Server = jest.fn();
+        const app = createApplication({
+            config: createConfig(), logger: createLogger(), bacnetClient, mqttClient,
+            authService, deliverInitialAdminPassword, Server
+        });
+        const started = app.init();
+        await Promise.resolve();
+        const closed = app.shutdown();
+        expect(authService.close).not.toHaveBeenCalled();
+        finishSeed('bootstrap-password');
+        await Promise.all([started, closed]);
+
+        expect(deliverInitialAdminPassword).toHaveBeenCalledWith('admin', 'bootstrap-password');
+        expect(authService.close).toHaveBeenCalledTimes(1);
+        expect(Server).not.toHaveBeenCalled();
+        expect(bacnetClient.listenerCount('values')).toBe(0);
+        expect(mqttClient.listenerCount('bacnetWriteCommand')).toBe(0);
+    });
 });

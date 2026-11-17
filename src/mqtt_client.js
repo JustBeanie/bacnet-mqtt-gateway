@@ -3,6 +3,7 @@ const config = require('config');
 const fs = require('fs');
 const EventEmitter = require('events');
 const { logger } = require('./common');
+const { parseWriteCommand } = require('./bacnet_validation');
 const { version: appVersion } = require('../package.json');
 
 const gatewayId = config.get('mqtt.gatewayId');
@@ -50,6 +51,9 @@ const BACNET_UNITS = new Map([
 const BINARY_OBJECT_TYPES = new Set([3, 4, 5, 55]);
 const MEASUREMENT_OBJECT_TYPES = new Set([0, 1, 2, 12, 18, 23, 24, 46, 54]);
 const MAX_PENDING_PUBLISHES = 5000;
+const MAX_IN_FLIGHT_PUBLISHES = 32;
+const MQTT_CLOSE_TIMEOUT_MS = 2000;
+const RETAINED_QOS1 = { qos: 1, retain: true };
 
 function sanitizeTopicSegment(value) {
     return String(value)
@@ -73,6 +77,11 @@ class MqttClient extends EventEmitter {
         this.lastLoggedError = null;
         this.discoveryPayloads = new Map();
         this.pendingPublishes = new Map();
+        this.inFlightPublishes = new Map();
+        this.dirtyDiscovery = new Set();
+        this.closePromise = null;
+        this.onlineQueued = false;
+        this.subscriptionPending = false;
         this.droppedPublishCount = 0;
         this.availabilityTopic = `bacnet-gateway/${gatewayId}/status`;
 
@@ -86,6 +95,7 @@ class MqttClient extends EventEmitter {
             reconnectPeriod: 5000,
             connectTimeout: 30000,
             queueQoSZero: false,
+            resubscribe: false,
             will: {
                 topic: this.availabilityTopic,
                 payload: 'offline',
@@ -97,30 +107,32 @@ class MqttClient extends EventEmitter {
         this._applyTlsOptions(options);
         this.client = mqtt.connect(options);
 
-        this.client.on('connect', () => this._onConnect());
-        this.client.on('message', (topic, message) => this._onMessage(topic, message));
-        this.client.on('error', (error) => {
-            this.lastError = error.message;
+        const onDisconnected = () => {
             this.connected = false;
-            if (this.closing) {
-                return;
-            }
-            const now = Date.now();
-            if (this.lastLoggedError !== error.message || now - this.lastErrorLoggedAt >= 30000) {
-                logger.log('error', `[MQTT] Connection error: ${error.message}`);
-                this.lastLoggedError = error.message;
-                this.lastErrorLoggedAt = now;
-            }
-        });
-        this.client.on('close', () => {
-            this.connected = false;
-        });
-        this.client.on('offline', () => {
-            this.connected = false;
-        });
-        this.client.on('reconnect', () => {
-            this.connected = false;
-        });
+            this.onCloseProgress?.();
+        };
+        this.clientListeners = {
+            connect: () => this._onConnect(),
+            message: (topic, message) => this._onMessage(topic, message),
+            error: (error) => this._onConnectionError(error),
+            close: onDisconnected,
+            offline: onDisconnected,
+            reconnect: onDisconnected
+        };
+        for (const [event, listener] of Object.entries(this.clientListeners)) this.client.on(event, listener);
+    }
+
+    _onConnectionError(error) {
+        this.connected = false;
+        this.lastError = error.message;
+        if (this.closing) return;
+
+        const now = Date.now();
+        if (this.lastLoggedError !== error.message || now - this.lastErrorLoggedAt >= 30000) {
+            logger.log('error', `[MQTT] Connection error: ${error.message}`);
+            this.lastLoggedError = error.message;
+            this.lastErrorLoggedAt = now;
+        }
     }
 
     _applyTlsOptions(options) {
@@ -157,104 +169,115 @@ class MqttClient extends EventEmitter {
         this.lastLoggedError = null;
         this.lastErrorLoggedAt = 0;
         const writeTopicPattern = `bacnetwrite/${gatewayId}/+/+/+/set`;
-        this.client.subscribe(writeTopicPattern, { qos: 1 }, (err) => {
-            if (err) {
-                logger.log('error', `[MQTT] Error subscribing to write topic pattern ${writeTopicPattern}: ${err}`);
-            }
+        this.subscriptionPending = true;
+        this.client.subscribe(writeTopicPattern, { qos: 1 }, (error) => {
+            this.subscriptionPending = false;
+            if (error) logger.log('error', `[MQTT] Error subscribing to ${writeTopicPattern}: ${error.message}`);
+            this.onCloseProgress?.();
         });
 
-        this._publish(this.availabilityTopic, 'online', { qos: 1, retain: true });
-        for (const [topic, payload] of this.discoveryPayloads.entries()) {
-            this._publish(topic, payload, { qos: 1, retain: true });
-        }
-
-        const pending = Array.from(this.pendingPublishes.entries());
-        this.pendingPublishes.clear();
-        for (const [topic, entry] of pending) {
-            if (topic !== this.availabilityTopic && !this.discoveryPayloads.has(topic)) {
-                this._publish(topic, entry.message, entry.options);
-            }
-        }
+        this.onlineQueued = true;
+        this.dirtyDiscovery = new Set(this.discoveryPayloads.keys());
+        this._drainPublishes();
     }
 
     _onMessage(topic, message) {
-        const topicParts = topic.split('/');
-        if (topicParts.length !== 6 || topicParts[0] !== 'bacnetwrite' || topicParts[5] !== 'set') {
-            return;
-        }
+        if (this.closing) return;
+        const parts = topic.split('/');
+        const [prefix, receivedGatewayId, deviceId, objectKey, propertyId, action] = parts;
+        if (parts.length !== 6 || prefix !== 'bacnetwrite' || receivedGatewayId !== gatewayId || action !== 'set') return;
 
-        const receivedGatewayId = topicParts[1];
-        const deviceIdFromTopic = topicParts[2];
-        const objectKey = topicParts[3];
-        const propertyIdFromTopicStr = topicParts[4];
-
-        if (receivedGatewayId !== gatewayId) {
-            logger.log('warn', `[MQTT Write] Received write command for wrong gatewayId. Expected ${gatewayId}, got ${receivedGatewayId}. Ignoring.`);
-            return;
-        }
-
-        const objectIdParts = objectKey.split('_');
-        if (objectIdParts.length !== 2) {
-            logger.log('warn', `[MQTT Write] Malformed objectKey in topic ${topic}: ${objectKey}. Expected type_instance.`);
-            return;
-        }
-
-        const objectType = parseInt(objectIdParts[0], 10);
-        const objectInstance = parseInt(objectIdParts[1], 10);
-        const propertyIdFromTopic = parseInt(propertyIdFromTopicStr, 10);
-
-        if (isNaN(objectType) || isNaN(objectInstance) || isNaN(propertyIdFromTopic)) {
-            logger.log('warn', `[MQTT Write] Invalid objectType, objectInstance, or propertyId in topic ${topic}. Parts: type=${objectType}, instance=${objectInstance}, propId=${propertyIdFromTopic}`);
-            return;
-        }
-
+        const [objectType, objectInstance, extra] = objectKey.split('_');
+        if (extra !== undefined) return;
         let payload;
         try {
             payload = JSON.parse(message.toString());
-        } catch (_e) {
+        } catch {
             payload = { value: message.toString() };
         }
-
-        if (payload.value === undefined) {
-            logger.log('warn', `[MQTT Write] No 'value' field in JSON payload for topic ${topic}.`);
+        let command;
+        try {
+            command = parseWriteCommand({ ...payload, deviceId, objectType, objectInstance, propertyId });
+        } catch (error) {
+            logger.log('warn', `[MQTT Write] Invalid command for ${topic}: ${error.message}`);
             return;
         }
-
-        this.emit('bacnetWriteCommand', {
-            deviceId: deviceIdFromTopic,
-            objectKey,
-            objectType,
-            objectInstance,
-            propertyId: propertyIdFromTopic,
-            value: payload.value,
-            priority: payload.priority,
-            bacnetApplicationTag: payload.bacnetApplicationTag
-        });
+        this.emit('bacnetWriteCommand', { ...command, objectKey });
     }
 
     _publish(topic, message, options = {}) {
-        if (!this.connected && !this.closing) {
-            if (!this.pendingPublishes.has(topic) && this.pendingPublishes.size >= MAX_PENDING_PUBLISHES) {
-                const oldestTopic = this.pendingPublishes.keys().next().value;
-                this.pendingPublishes.delete(oldestTopic);
-                this.droppedPublishCount += 1;
-                logger.log('warn', `[MQTT] Offline publish buffer full; dropped oldest topic ${oldestTopic}.`);
-            }
-            this.pendingPublishes.delete(topic);
-            this.pendingPublishes.set(topic, { message, options: { ...options } });
-            return;
+        if (this.closing) return;
+        if (!this.pendingPublishes.has(topic) && this.pendingPublishes.size >= MAX_PENDING_PUBLISHES) {
+            const oldestTopic = this.pendingPublishes.keys().next().value;
+            this.pendingPublishes.delete(oldestTopic);
+            this.droppedPublishCount += 1;
+            if (this.droppedPublishCount === 1) logger.log('warn', '[MQTT] Publish buffer full. Dropping oldest pending topics.');
         }
+        this.pendingPublishes.delete(topic);
+        this.pendingPublishes.set(topic, { message, options });
+        this._drainPublishes();
+    }
 
-        this.client.publish(topic, message, options, (err) => {
-            if (err) {
-                this.publishFailureCount += 1;
-                this.lastError = err.message || String(err);
-                logger.log('error', `[MQTT] Publish failed for ${topic}: ${this.lastError}`);
-                return;
+    _drainPublishes() {
+        if (this.drainingPublishes || this.closing) return;
+        this.drainingPublishes = true;
+        try {
+            while (this.connected && !this.closing && this.inFlightPublishes.size < MAX_IN_FLIGHT_PUBLISHES) {
+                if (this.onlineQueued && !this.inFlightPublishes.has(this.availabilityTopic)) {
+                    this.onlineQueued = false;
+                    this._send(this.availabilityTopic, 'online', RETAINED_QOS1);
+                    continue;
+                }
+
+                const discovery = this._takeReadyTopic(this.dirtyDiscovery);
+                if (discovery !== undefined) {
+                    const entry = this.discoveryPayloads.get(discovery);
+                    this._send(discovery, entry.payload, RETAINED_QOS1, (error) => { entry.retry = Boolean(error); });
+                    continue;
+                }
+
+                const topic = this._takeReadyTopic(this.pendingPublishes);
+                if (topic === undefined) break;
+                const { message, options } = this.pendingPublishes.get(topic);
+                this.pendingPublishes.delete(topic);
+                this._send(topic, message, options);
             }
-            this.publishSuccessCount += 1;
-            this.lastPublishedAt = Date.now();
-        });
+        } finally {
+            this.drainingPublishes = false;
+        }
+    }
+
+    _takeReadyTopic(queue) {
+        for (const topic of queue.keys()) {
+            if (!this.inFlightPublishes.has(topic)) {
+                if (queue === this.dirtyDiscovery) queue.delete(topic);
+                return topic;
+            }
+        }
+    }
+
+    _send(topic, message, options, onResult) {
+        const done = (error) => {
+            if (this.inFlightPublishes.get(topic) !== done) return;
+            this.inFlightPublishes.delete(topic);
+            if (error) {
+                this.publishFailureCount += 1;
+                this.lastError = error.message;
+                if (!this.closing) logger.log('error', `[MQTT] Publish failed for ${topic}: ${error.message}`);
+            } else {
+                this.publishSuccessCount += 1;
+                this.lastPublishedAt = Date.now();
+            }
+            onResult?.(error);
+            if (this.closing) this.onCloseProgress?.();
+            else this._drainPublishes();
+        };
+        this.inFlightPublishes.set(topic, done);
+        try {
+            this.client.publish(topic, message, options, done);
+        } catch (error) {
+            done(error);
+        }
     }
 
     _getHaComponentType(objectKey) {
@@ -335,9 +358,12 @@ class MqttClient extends EventEmitter {
             const discovery = this._buildDiscovery(component, entityKey, objectKey, telemetry, stateTopic, attributesTopic);
             const priorDiscovery = this.discoveryPayloads.get(discovery.topic);
 
-            if (priorDiscovery !== discovery.payload) {
-                this.discoveryPayloads.set(discovery.topic, discovery.payload);
-                this._publish(discovery.topic, discovery.payload, { qos: 1, retain: true });
+            if (priorDiscovery?.payload !== discovery.payload || priorDiscovery.retry) {
+                this.discoveryPayloads.set(discovery.topic, {
+                    payload: discovery.payload, deviceId: String(telemetry.deviceId), objectKey,
+                    topics: [stateTopic, attributesTopic, canonicalTopic]
+                });
+                this.dirtyDiscovery.add(discovery.topic);
             }
 
             this._publish(stateTopic, this._normalizeState(component, telemetry.value), { qos: 1, retain: true });
@@ -357,7 +383,18 @@ class MqttClient extends EventEmitter {
         }
     }
 
+    pruneDevicePublishes(deviceId, objectKeys) {
+        const current = new Set(objectKeys);
+        for (const [topic, discovery] of this.discoveryPayloads) {
+            if (discovery.deviceId !== deviceId || current.has(discovery.objectKey)) continue;
+            this.discoveryPayloads.delete(topic);
+            this.dirtyDiscovery.delete(topic);
+            for (const telemetryTopic of discovery.topics) this.pendingPublishes.delete(telemetryTopic);
+        }
+    }
+
     publishMessage(messageJson) {
+        if (this.closing) return;
         if (messageJson && typeof messageJson === 'object' && !Array.isArray(messageJson)) {
             const keys = Object.keys(messageJson);
             const looksLikeTelemetryMap = keys.length > 0 && keys.every((key) => {
@@ -395,32 +432,67 @@ class MqttClient extends EventEmitter {
     }
 
     close() {
-        if (this.closing) {
-            return Promise.resolve();
-        }
+        this.closePromise ??= this._close();
+        return this.closePromise;
+    }
+
+    _close() {
         this.closing = true;
+        this.pendingPublishes.clear();
+        this.discoveryPayloads.clear();
+        this.dirtyDiscovery.clear();
+        this.onlineQueued = false;
 
         return new Promise((resolve) => {
-            let ended = false;
-            const endClient = () => {
-                if (ended) {
-                    return;
-                }
-                ended = true;
+            let ending = false;
+            let finished = false;
+            let sentOffline = false;
+            let acknowledgedOffline = false;
+
+            const finish = () => {
+                if (finished) return;
+                finished = true;
+                clearTimeout(deadline);
                 this.connected = false;
-                if (!this.client || typeof this.client.end !== 'function') {
-                    resolve();
-                    return;
-                }
-                this.client.end(false, {}, resolve);
+                this.inFlightPublishes.clear();
+                this.onCloseProgress = null;
+                for (const [event, listener] of Object.entries(this.clientListeners)) this.client.removeListener(event, listener);
+                resolve();
             };
 
-            if (!this.connected || !this.client || typeof this.client.publish !== 'function') {
-                endClient();
-                return;
-            }
+            const end = (force) => {
+                if (ending) return;
+                ending = true;
+                try {
+                    this.client.end(force, {}, finish);
+                } catch {
+                    finish();
+                }
+            };
 
-            this.client.publish(this.availabilityTopic, 'offline', { qos: 1, retain: true }, endClient);
+            this.onCloseProgress = () => {
+                if (ending) return;
+                if (!this.connected) {
+                    end(true);
+                    return;
+                }
+                if (!sentOffline && this.inFlightPublishes.size < MAX_IN_FLIGHT_PUBLISHES
+                    && !this.inFlightPublishes.has(this.availabilityTopic)) {
+                    sentOffline = true;
+                    this._send(this.availabilityTopic, 'offline', RETAINED_QOS1, (error) => {
+                        if (error) end(true);
+                        else acknowledgedOffline = true;
+                    });
+                }
+                if (acknowledgedOffline && this.inFlightPublishes.size === 0 && !this.subscriptionPending) end(false);
+            };
+
+            const deadline = setTimeout(() => {
+                if (ending) this.client.stream?.destroy();
+                else end(true);
+                finish();
+            }, MQTT_CLOSE_TIMEOUT_MS);
+            this.onCloseProgress();
         });
     }
 
@@ -431,6 +503,7 @@ class MqttClient extends EventEmitter {
             publishSuccessCount: this.publishSuccessCount,
             publishFailureCount: this.publishFailureCount,
             pendingPublishCount: this.pendingPublishes.size,
+            inFlightPublishCount: this.inFlightPublishes.size,
             droppedPublishCount: this.droppedPublishCount,
             lastPublishedAt: this.lastPublishedAt
         };

@@ -208,4 +208,55 @@ describe('AuthService', () => {
         expect(recreatedAdmin).toBeTruthy();
         expect(recreatedAdmin.role).toBe('admin');
     });
+    test('concurrent refreshes produce one usable replacement and close idempotently', async () => {
+        const { AuthService } = require('../src/auth_service');
+        service = new AuthService();
+        await service.init();
+        const admin = await service.findUser('admin');
+        const original = await service.generateRefreshToken(admin.id);
+
+        const results = await Promise.allSettled([
+            service.rotateRefreshToken(original), service.rotateRefreshToken(original)
+        ]);
+        const replacements = results.filter(({ status }) => status === 'fulfilled');
+        expect(replacements).toHaveLength(1);
+        expect(results.find(({ status }) => status === 'rejected').reason.message).toBe('Invalid refresh token');
+        await expect(service._getRefreshToken(original)).resolves.toBeNull();
+        await expect(service._getRefreshToken(replacements[0].value)).resolves.toMatchObject({ user_id: admin.id });
+
+        const closed = service.close();
+        expect(service.close()).toBe(closed);
+        await closed;
+    });
+
+    test('opening an existing database removes expired tokens and preserves active sessions', async () => {
+        const { AuthService } = require('../src/auth_service');
+        service = new AuthService();
+        await service.init();
+        const { id } = await service.findUser('admin');
+        const active = await service.generateRefreshToken(id);
+        const expired = await service.generateRefreshToken(id);
+        await service._run('UPDATE refresh_tokens SET expires_at = ? WHERE token = ?', [Date.now() - 1, expired]);
+        await service.close();
+
+        service = new AuthService();
+        await expect(service.init()).resolves.toBeNull();
+        await expect(service._getRefreshToken(expired)).resolves.toBeNull();
+        await expect(service._getRefreshToken(active)).resolves.toMatchObject({ user_id: id });
+    });
+
+    test('two password changes cannot both use the same old password', async () => {
+        const { AuthService } = require('../src/auth_service');
+        service = new AuthService();
+        const original = await service.init();
+        const { id } = await service.findUser('admin');
+
+        const results = await Promise.allSettled([
+            service.changePassword(id, original, 'first-password'),
+            service.changePassword(id, original, 'second-password')
+        ]);
+        expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+        const password = results[0].status === 'fulfilled' ? 'first-password' : 'second-password';
+        await expect(service.validateUser('admin', password)).resolves.toMatchObject({ id });
+    });
 });

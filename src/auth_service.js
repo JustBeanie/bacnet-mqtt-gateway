@@ -23,14 +23,24 @@ class AuthService {
         this.tokenExpiresIn = authCfg.tokenExpiresIn || '1h';
         this.refreshTokenExpiresHours = authCfg.refreshTokenExpiresHours || 168; // 7 days
         this.db = null;
-        this.initialAdminPassword = null;
+        this.initPromise = null;
+        this.closePromise = null;
+        this.nextTokenCleanupAt = 0;
     }
 
-    async init() {
+    init() {
+        if (this.closePromise) {
+            return Promise.reject(new Error('Auth service is closed'));
+        }
+        this.initPromise ??= this._init();
+        return this.initPromise;
+    }
+
+    async _init() {
         await this._openDb();
         await this._migrate();
-        await this._seedAdmin();
-        return this.initialAdminPassword;
+        await this._pruneExpiredTokens(Date.now());
+        return this._seedAdmin();
     }
 
     _generateRandomPassword() {
@@ -69,6 +79,7 @@ class AuthService {
                     expires_at INTEGER NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
                 );
+                CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expiration ON refresh_tokens(expires_at);
             `;
             this.db.exec(sql, (err) => {
                 if (err) {
@@ -81,55 +92,50 @@ class AuthService {
         });
     }
 
-    _seedAdmin() {
-        return new Promise((resolve, reject) => {
-            this.db.get('SELECT COUNT(*) as count FROM users', async (err, row) => {
-                if (err) {
-                    logger.log('error', `[Auth] Failed to count users: ${err}`);
-                    reject(err);
-                    return;
-                }
-                if (row.count > 0) {
-                    resolve();
-                    return;
-                }
-                const password = this._generateRandomPassword();
-                const hash = await bcrypt.hash(password, 10);
-                this.db.run(
-                    'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-                    ['admin', hash, 'admin'],
-                    (insertErr) => {
-                        if (insertErr) {
-                            logger.log('error', `[Auth] Failed to seed admin user: ${insertErr}`);
-                            reject(insertErr);
-                        } else {
-                            this.initialAdminPassword = password;
-                            logger.log('info', '[Auth] Seeded initial admin user.');
-                            resolve();
-                        }
-                    }
-                );
+    async _seedAdmin() {
+        const row = await new Promise((resolve, reject) => {
+            this.db.get('SELECT COUNT(*) as count FROM users', (err, result) => {
+                if (err) reject(err);
+                else resolve(result);
             });
         });
+        if (row.count > 0) return null;
+
+        const password = this._generateRandomPassword();
+        const hash = await bcrypt.hash(password, 10);
+        const changes = await this._run(
+            `INSERT OR IGNORE INTO users (username, password, role)
+             SELECT 'admin', ?, 'admin' WHERE NOT EXISTS (SELECT 1 FROM users)`,
+            [hash]
+        );
+        if (changes === 0) return null;
+        logger.log('info', '[Auth] Seeded initial admin user.');
+        return password;
     }
 
-    createUser(username, password, role = 'viewer') {
-        return new Promise(async (resolve, reject) => {
-            if (!ROLE_ORDER[role]) {
-                return reject(new Error('Invalid role'));
-            }
-            const hash = await bcrypt.hash(password, 10);
+    async createUser(username, password, role = 'viewer') {
+        if (!Object.hasOwn(ROLE_ORDER, role)) {
+            throw new Error('Invalid role');
+        }
+        const hash = await bcrypt.hash(password, 10);
+        return new Promise((resolve, reject) => {
             this.db.run(
                 'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
                 [username, hash, role],
                 function(err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve({ id: this.lastID, username, role });
-                    }
+                    if (err) reject(err);
+                    else resolve({ id: this.lastID, username, role });
                 }
             );
+        });
+    }
+
+    _run(sql, params) {
+        return new Promise((resolve, reject) => {
+            this.db.run(sql, params, function(err) {
+                if (err) reject(err);
+                else resolve(this.changes);
+            });
         });
     }
 
@@ -174,38 +180,45 @@ class AuthService {
 
     async generateRefreshToken(userId) {
         const token = crypto.randomBytes(32).toString('base64url');
-        const expiresAt = Date.now() + this.refreshTokenExpiresHours * 60 * 60 * 1000;
-        await this._insertRefreshToken(token, userId, expiresAt);
+        const now = Date.now();
+        await this._pruneExpiredTokens(now);
+        await this._run(
+            'INSERT INTO refresh_tokens (token, user_id, expires_at) VALUES (?, ?, ?)',
+            [token, userId, this._refreshExpiration(now)]
+        );
         return token;
     }
 
-    _insertRefreshToken(token, userId, expiresAt) {
-        return new Promise((resolve, reject) => {
-            this.db.run(
-                'INSERT INTO refresh_tokens (token, user_id, expires_at) VALUES (?, ?, ?)',
-                [token, userId, expiresAt],
-                function(err) {
-                    if (err) {
-                        reject(err);
-                    } else {
-                        resolve();
-                    }
-                }
-            );
-        });
+    _refreshExpiration(now) {
+        return now + this.refreshTokenExpiresHours * 60 * 60 * 1000;
+    }
+
+    async _pruneExpiredTokens(now) {
+        if (now < this.nextTokenCleanupAt) return;
+        this.nextTokenCleanupAt = now + 60 * 60 * 1000;
+        try {
+            await this._run('DELETE FROM refresh_tokens WHERE expires_at < ?', [now]);
+        } catch (error) {
+            this.nextTokenCleanupAt = 0;
+            throw error;
+        }
     }
 
     async rotateRefreshToken(oldToken) {
-        const stored = await this._getRefreshToken(oldToken);
-        if (!stored) {
-            throw new Error('Invalid refresh token');
+        const nextToken = crypto.randomBytes(32).toString('base64url');
+        const now = Date.now();
+        const changes = await this._run(
+            'UPDATE refresh_tokens SET token = ?, expires_at = ? WHERE token = ? AND expires_at >= ?',
+            [nextToken, this._refreshExpiration(now), oldToken, now]
+        );
+        if (changes === 1) {
+            // Rotation already committed. A maintenance failure must not hide the replacement.
+            await this._pruneExpiredTokens(now).catch((error) => logger.log('warn', `[Auth] Token cleanup failed: ${error.message}`));
+            return nextToken;
         }
-        if (stored.expires_at < Date.now()) {
-            await this._deleteRefreshToken(oldToken);
-            throw new Error('Refresh token expired');
-        }
-        await this._deleteRefreshToken(oldToken);
-        return this.generateRefreshToken(stored.user_id);
+
+        const expired = await this._run('DELETE FROM refresh_tokens WHERE token = ? AND expires_at < ?', [oldToken, now]);
+        throw new Error(expired ? 'Refresh token expired' : 'Invalid refresh token');
     }
 
     _getRefreshToken(token) {
@@ -215,18 +228,6 @@ class AuthService {
                     reject(err);
                 } else {
                     resolve(row || null);
-                }
-            });
-        });
-    }
-
-    _deleteRefreshToken(token) {
-        return new Promise((resolve, reject) => {
-            this.db.run('DELETE FROM refresh_tokens WHERE token = ?', [token], function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve();
                 }
             });
         });
@@ -245,7 +246,8 @@ class AuthService {
     }
 
     hasRequiredRole(userRole, minRole) {
-        return ROLE_ORDER[userRole] >= ROLE_ORDER[minRole];
+        return Object.hasOwn(ROLE_ORDER, userRole) && Object.hasOwn(ROLE_ORDER, minRole)
+            && ROLE_ORDER[userRole] >= ROLE_ORDER[minRole];
     }
 
     async changePassword(userId, oldPassword, newPassword) {
@@ -258,15 +260,8 @@ class AuthService {
             throw new Error('Invalid old password');
         }
         const hash = await bcrypt.hash(newPassword, 10);
-        return new Promise((resolve, reject) => {
-            this.db.run('UPDATE users SET password = ? WHERE id = ?', [hash, userId], function(err) {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve();
-                }
-            });
-        });
+        const changes = await this._run('UPDATE users SET password = ? WHERE id = ? AND password = ?', [hash, userId, user.password]);
+        if (changes === 0) throw new Error('Password changed. Sign in and try again.');
     }
 
     async setPassword(userId, newPassword) {
@@ -300,14 +295,18 @@ class AuthService {
     }
 
     close() {
-        if (!this.db) {
-            return Promise.resolve();
-        }
-        return new Promise((resolve, reject) => {
-            const db = this.db;
-            this.db = null;
-            db.close((err) => err ? reject(err) : resolve());
+        this.closePromise ??= this._close();
+        return this.closePromise;
+    }
+
+    async _close() {
+        await this.initPromise?.catch(() => {});
+        if (!this.db) return;
+        const db = this.db;
+        await new Promise((resolve, reject) => {
+            db.close((error) => error ? reject(error) : resolve());
         });
+        this.db = null;
     }
 }
 

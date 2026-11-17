@@ -7,6 +7,8 @@ const swaggerUi = require('swagger-ui-express');
 const YAML = require('yaml');
 const path = require('path'); 
 const rateLimit = require('express-rate-limit');
+const { BacnetUnavailableError } = require('./bacnet_requests');
+const { validateDeviceConfig, parseWriteCommand } = require('./bacnet_validation');
 
 const port = parseInt(config.get('httpServer.port'), 10);
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -82,6 +84,10 @@ class Server {
         this.trustIngress = getBooleanConfig('auth.trustIngress');
         this.ingressSources = getIngressSources();
         this.listener = null;
+        this.closePromise = null;
+        this.deviceScan = null;
+        this.activeHandlers = new Set();
+        this.rateLimitStores = [];
 
         this.app = express();
         if (typeof this.app.disable === 'function') {
@@ -90,6 +96,10 @@ class Server {
         if (this.trustIngress) {
             this.app.use(this._restrictIngressSource.bind(this));
         }
+        this.app.use((req, res, next) => {
+            if (this.closePromise) return res.status(503).send({ status: 'error', message: 'Gateway is shutting down' });
+            next();
+        });
         this.app.use(express.json({ limit: '1mb' }));
         if (!this.trustIngress) {
             this.app.use(cors());
@@ -103,6 +113,7 @@ class Server {
         const authLimiter = rateLimit({
             windowMs: 15 * 60 * 1000,
             max: 30,
+            store: this._createRateLimitStore(),
             standardHeaders: true,
             legacyHeaders: false,
             keyGenerator: (req) => this._rateLimitKey(req)
@@ -110,6 +121,7 @@ class Server {
         const apiLimiter = rateLimit({
             windowMs: 60 * 1000,
             max: 120,
+            store: this._createRateLimitStore(),
             standardHeaders: true,
             legacyHeaders: false,
             keyGenerator: (req) => this._rateLimitKey(req)
@@ -118,24 +130,24 @@ class Server {
         // auth routes
         this.app.get('/auth/mode', this._authMode.bind(this));
         if (!this.trustIngress) {
-            this.app.post('/auth/login', authLimiter, this._login.bind(this));
-            this.app.post('/auth/register', authLimiter, this._requireRole('admin'), this._register.bind(this));
-            this.app.post('/auth/refresh', authLimiter, this._refresh.bind(this));
-            this.app.post('/auth/change-password', authLimiter, this._requireRole('viewer'), this._changePassword.bind(this));
+            this.app.post('/auth/login', authLimiter, this._trackHandler(this._login));
+            this.app.post('/auth/register', authLimiter, this._requireRole('admin'), this._trackHandler(this._register));
+            this.app.post('/auth/refresh', authLimiter, this._trackHandler(this._refresh));
+            this.app.post('/auth/change-password', authLimiter, this._requireRole('viewer'), this._trackHandler(this._changePassword));
         }
 
         // health/metrics (unauthenticated)
-        this.app.get('/health', this._health.bind(this));
-        this.app.get('/metrics', this._metrics.bind(this));
+        this.app.get('/health', this._trackHandler(this._health));
+        this.app.get('/metrics', this._trackHandler(this._metrics));
 
         // protected API
         this.app.put('/api/bacnet/scan', apiLimiter, this._requireRole('viewer'), this._scanForDevices.bind(this));
-        this.app.put('/api/bacnet/:deviceId/objects', apiLimiter, this._requireRole('viewer'), this._scanDevice.bind(this));
+        this.app.put('/api/bacnet/:deviceId/objects', apiLimiter, this._requireRole('viewer'), this._trackHandler(this._scanDevice));
         this.app.get('/api/bacnet/configured', apiLimiter, this._requireRole('viewer'), this._listConfigured.bind(this));
-        this.app.get('/api/bacnet/runtime', apiLimiter, this._requireRole('viewer'), this._listRuntime.bind(this));
-        this.app.get('/api/bacnet/runtime-objects/:deviceId', apiLimiter, this._requireRole('viewer'), this._listRuntimeObjects.bind(this));
-        this.app.put('/api/bacnet/:deviceId/config', apiLimiter, this._requireRole('admin'), this._configurePolling.bind(this));
-        this.app.put('/api/bacnet/write', apiLimiter, this._requireRole('admin'), this._writeProperty.bind(this)); 
+        this.app.get('/api/bacnet/runtime', apiLimiter, this._requireRole('viewer'), this._trackHandler(this._listRuntime));
+        this.app.get('/api/bacnet/runtime-objects/:deviceId', apiLimiter, this._requireRole('viewer'), this._trackHandler(this._listRuntimeObjects));
+        this.app.put('/api/bacnet/:deviceId/config', apiLimiter, this._requireRole('admin'), this._trackHandler(this._configurePolling));
+        this.app.put('/api/bacnet/write', apiLimiter, this._requireRole('admin'), this._trackHandler(this._writeProperty));
 
         // start server
         this.listener = this.app.listen(port, () => {
@@ -234,39 +246,91 @@ class Server {
         });
     }
 
-    async close() {
-        const listener = this.listener;
-        this.listener = null;
-        if (!listener || typeof listener.close !== 'function' || listener.listening === false) {
-            return;
-        }
-
-        await new Promise((resolve, reject) => {
-            const done = (error) => {
-                if (!error || error.code === 'ERR_SERVER_NOT_RUNNING') {
-                    resolve();
-                    return;
-                }
-                reject(error);
-            };
-
-            try {
-                listener.close(done);
-            } catch (error) {
-                done(error);
-            }
-        });
+    _createRateLimitStore() {
+        const store = new rateLimit.MemoryStore();
+        this.rateLimitStores.push(store);
+        return store;
     }
 
-    _scanForDevices(req, res) {
-        const devices = [];
-        const eventListener = (device) => devices.push(device);
-        this.bacnetClient.on('deviceFound', eventListener);
-        this.bacnetClient.scanForDevices();
-        setTimeout(() => {
-            this.bacnetClient.removeListener('deviceFound', eventListener);
-            res.send(devices);
-        }, 5000);
+    _trackHandler(handler) {
+        return (req, res) => {
+            if (this.closePromise) return res.status(503).send({ status: 'error', message: 'Gateway is shutting down' });
+            const pending = handler.call(this, req, res);
+            this.activeHandlers.add(pending);
+            return pending.finally(() => this.activeHandlers.delete(pending));
+        };
+    }
+
+    close() {
+        this.closePromise ??= this._close();
+        return this.closePromise;
+    }
+
+    async _close() {
+        this._finishDeviceScan(503);
+        const listener = this.listener;
+        try {
+            if (listener) {
+                await new Promise((resolve, reject) => {
+                    listener.close((error) => {
+                        if (!error || error.code === 'ERR_SERVER_NOT_RUNNING') resolve();
+                        else reject(error);
+                    });
+                });
+                this.listener = null;
+            }
+        } finally {
+            await Promise.allSettled(this.activeHandlers || []);
+            for (const store of this.rateLimitStores || []) store.shutdown();
+        }
+    }
+
+    forceClose() {
+        this.listener?.closeAllConnections?.();
+    }
+
+    _finishDeviceScan(status) {
+        const scan = this.deviceScan;
+        if (!scan) return;
+        this.deviceScan = null;
+        clearTimeout(scan.timer);
+        this.bacnetClient.removeListener('deviceFound', scan.collect);
+        const devices = Array.from(scan.devices.values());
+        for (const [res, onClose] of scan.responses) {
+            res.removeListener?.('close', onClose);
+            if (status === 200) res.send(devices);
+            else res.status(status).send({ status: 'error', message: 'BACnet discovery is unavailable' });
+        }
+        scan.responses.clear();
+    }
+
+    _scanForDevices(_req, res) {
+        if (this.closePromise) return res.status(503).send({ status: 'error', message: 'Gateway is shutting down' });
+        const newScan = !this.deviceScan;
+        if (newScan) {
+            const devices = new Map();
+            const collect = (device) => devices.set(JSON.stringify([device.deviceId, device.address]), device);
+            this.deviceScan = { devices, collect, responses: new Map() };
+            this.bacnetClient.on('deviceFound', collect);
+            this.deviceScan.timer = setTimeout(() => this._finishDeviceScan(200), 5000);
+        }
+
+        const scan = this.deviceScan;
+        const onClose = () => {
+            scan.responses.delete(res);
+            if (this.deviceScan === scan && scan.responses.size === 0) this._finishDeviceScan(200);
+        };
+        scan.responses.set(res, onClose);
+        res.once?.('close', onClose);
+
+        if (newScan) {
+            try {
+                this.bacnetClient.scanForDevices();
+            } catch (error) {
+                logger.log('warn', `[Discovery] Network scan failed: ${error.message}`);
+                this._finishDeviceScan(503);
+            }
+        }
     }
 
     async _scanDevice(req, res) {
@@ -274,9 +338,13 @@ class Server {
         if (!device || device.deviceId === undefined || !device.address) {
             return res.status(400).send({ status: 'error', message: 'deviceId and address are required in request body.' });
         }
+        const saveConfig = req.query?.saveConfig === 'true';
+        if (saveConfig && req.user?.role !== 'admin') {
+            return res.status(403).send({ status: 'error', message: 'Forbidden' });
+        }
         try {
             const deviceObjects = await this.bacnetClient.scanDevice(device);
-            if (req.query.saveConfig === 'true') {
+            if (saveConfig && !res.destroyed) {
                 await this.bacnetClient.saveConfig({
                     device,
                     polling: { class: 'normal' },
@@ -286,7 +354,9 @@ class Server {
             res.send(deviceObjects);
         } catch (err) {
             logger.log('error', `[API] Failed to scan device ${JSON.stringify(device)}: ${err}`);
-            res.status(500).send({ status: 'error', message: 'Failed to scan device', details: err && err.message ? err.message : err });
+            res.status(err instanceof BacnetUnavailableError ? 503 : 500).send({
+                status: 'error', message: 'Failed to scan device', details: err.message
+            });
         }
     }
 
@@ -356,7 +426,13 @@ class Server {
             `bacnet_gateway_mqtt_publish_success_total ${mqttStatus.publishSuccessCount || 0}`,
             '# HELP bacnet_gateway_mqtt_publish_failure_total Total failed MQTT publishes',
             '# TYPE bacnet_gateway_mqtt_publish_failure_total counter',
-            `bacnet_gateway_mqtt_publish_failure_total ${mqttStatus.publishFailureCount || 0}`
+            `bacnet_gateway_mqtt_publish_failure_total ${mqttStatus.publishFailureCount || 0}`,
+            '# TYPE bacnet_gateway_mqtt_pending_publishes gauge',
+            `bacnet_gateway_mqtt_pending_publishes ${mqttStatus.pendingPublishCount || 0}`,
+            '# TYPE bacnet_gateway_mqtt_in_flight_publishes gauge',
+            `bacnet_gateway_mqtt_in_flight_publishes ${mqttStatus.inFlightPublishCount || 0}`,
+            '# TYPE bacnet_gateway_mqtt_dropped_publishes_total counter',
+            `bacnet_gateway_mqtt_dropped_publishes_total ${mqttStatus.droppedPublishCount || 0}`
         ];
         res.type('text/plain').send(lines.join('\n'));
     }
@@ -418,36 +494,9 @@ class Server {
 
     async _configurePolling(req, res) {
         const config = req.body;
-        const validationErrors = [];
-
-        if (!config || !config.device || config.device.deviceId === undefined || !config.device.address) {
-            validationErrors.push('device.deviceId and device.address are required.');
-        }
-        if (!config || !config.polling) {
-            validationErrors.push('polling configuration is required.');
-        } else if (!config.polling.schedule && !config.polling.intervalMs && !config.polling.class) {
-            validationErrors.push('polling.schedule, polling.intervalMs, or polling.class is required.');
-        }
-        if (config && config.polling && config.polling.intervalMs !== undefined) {
-            const intervalMs = parseInt(config.polling.intervalMs, 10);
-            if (isNaN(intervalMs) || intervalMs <= 0) {
-                validationErrors.push('polling.intervalMs must be a positive number.');
-            }
-        }
-        if (config && config.polling && config.polling.freshnessMs !== undefined) {
-            const freshnessMs = parseInt(config.polling.freshnessMs, 10);
-            if (isNaN(freshnessMs) || freshnessMs <= 0) {
-                validationErrors.push('polling.freshnessMs must be a positive number.');
-            }
-        }
-        if (!config || !Array.isArray(config.objects) || config.objects.length === 0) {
-            validationErrors.push('objects must be a non-empty array.');
-        } else {
-            config.objects.forEach((obj, idx) => {
-                if (!obj || !obj.objectId || obj.objectId.type === undefined || obj.objectId.instance === undefined) {
-                    validationErrors.push(`objects[${idx}].objectId.type and objectId.instance are required.`);
-                }
-            });
+        const validationErrors = validateDeviceConfig(config, { requirePolling: true });
+        if (req.params?.deviceId && req.params.deviceId !== String(config?.device?.deviceId)) {
+            validationErrors.push('The URL deviceId must match device.deviceId.');
         }
 
         if (validationErrors.length > 0) {
@@ -459,70 +508,36 @@ class Server {
             res.send({});
         } catch (err) {
             logger.log('error', `[API] Failed to configure polling: ${err}`);
-            res.status(500).send({ status: 'error', message: 'Failed to configure polling', details: err && err.message ? err.message : err });
+            const status = err instanceof BacnetUnavailableError ? 503 : err instanceof TypeError ? 400 : 500;
+            res.status(status).send({ status: 'error', message: 'Failed to configure polling', details: err.message });
         }
     }
 
     async _writeProperty(req, res) {
-        const {
-            deviceId, // This is the key from your device config files (e.g., "114", "baspi1")
-            objectType,
-            objectInstance,
-            propertyId,
-            value,
-            priority,
-            bacnetApplicationTag
-        } = req.body;
-
-        if (deviceId === undefined || objectType === undefined || objectInstance === undefined || propertyId === undefined || value === undefined) {
-            return res.status(400).send({ status: 'error', message: 'Missing required fields: deviceId, objectType, objectInstance, propertyId, value' });
-        }
-        if (typeof value === 'object' && value !== null) {
-            return res.status(400).send({ status: 'error', message: 'value must be a primitive type (string/number/boolean).' });
-        }
-        if (priority !== undefined && (isNaN(parseInt(priority, 10)) || priority < 1 || priority > 16)) {
-            return res.status(400).send({ status: 'error', message: 'priority must be a number between 1 and 16.' });
-        }
-        if (bacnetApplicationTag !== undefined && isNaN(parseInt(bacnetApplicationTag, 10))) {
-            return res.status(400).send({ status: 'error', message: 'bacnetApplicationTag must be numeric if provided.' });
+        let command;
+        try {
+            command = parseWriteCommand(req.body);
+        } catch (error) {
+            return res.status(400).send({ status: 'error', message: error.message });
         }
 
-        const deviceConfig = this.bacnetClient.deviceConfigs.get(deviceId.toString());
-
-        if (!deviceConfig || !deviceConfig.device || !deviceConfig.device.address) {
+        const { deviceId, objectType, objectInstance, propertyId, value, priority, bacnetApplicationTag } = command;
+        const address = this.bacnetClient.deviceConfigs.get(String(deviceId))?.device.address;
+        if (!address) {
             return res.status(404).send({ status: 'error', message: `Device configuration not found for deviceId: ${deviceId}` });
         }
 
-        const deviceAddress = deviceConfig.device.address;
-        const bacnetObjectId = { type: parseInt(objectType, 10), instance: parseInt(objectInstance, 10) };
-        const propIdToUse = parseInt(propertyId, 10);
-        const appTagToUse = bacnetApplicationTag !== undefined ? parseInt(bacnetApplicationTag, 10) : undefined;
-        const priorityToUse = priority !== undefined ? parseInt(priority, 10) : undefined;
-
-        if (isNaN(bacnetObjectId.type) || isNaN(bacnetObjectId.instance) || isNaN(propIdToUse)) {
-            return res.status(400).send({ status: 'error', message: 'objectType, objectInstance, and propertyId must be numbers.' });
-        }
-        if (priorityToUse !== undefined && (isNaN(priorityToUse) || priorityToUse < 1 || priorityToUse > 16)) {
-            return res.status(400).send({ status: 'error', message: 'priority must be a number between 1 and 16.' });
-        }
-         if (appTagToUse !== undefined && isNaN(appTagToUse)) {
-            return res.status(400).send({ status: 'error', message: 'bacnetApplicationTag must be a number.' });
-        }
-
-
         try {
-            const writeResponse = await this.bacnetClient.writeProperty(
-                deviceAddress,
-                bacnetObjectId,
-                propIdToUse,
-                value,
-                priorityToUse,
-                appTagToUse
+            const response = await this.bacnetClient.writeProperty(
+                address, { type: objectType, instance: objectInstance }, propertyId, value, priority, bacnetApplicationTag, deviceId
             );
-            res.status(200).send({ status: 'success', message: 'Write operation successful', response: writeResponse });
+            res.status(200).send({ status: 'success', message: 'Write operation successful', response });
         } catch (error) {
-            logger.log('error', `[API Write] Failed for DeviceId ${deviceId}: ${error.message || error}`);
-            res.status(500).send({ status: 'error', message: `BACnet write operation failed: ${error.message || error}`, details: error });
+            logger.log('error', `[API Write] Failed for DeviceId ${deviceId}: ${error.message}`);
+            const status = error instanceof BacnetUnavailableError ? 503 : error instanceof TypeError ? 400 : 500;
+            res.status(status).send({
+                status: 'error', message: `BACnet write operation failed: ${error.message}`
+            });
         }
     }
 

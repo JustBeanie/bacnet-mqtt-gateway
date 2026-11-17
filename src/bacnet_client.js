@@ -5,6 +5,12 @@ const { EventEmitter } = require('events');
 const { BacnetConfig } = require('./bacnet_config');
 const { DeviceObjectId, DeviceObject, logger } = require('./common');
 const { RuntimeState } = require('./runtime_state');
+const { BacnetRequests, BacnetUnavailableError } = require('./bacnet_requests');
+const { validateDeviceConfig } = require('./bacnet_validation');
+
+const { PropertyIdentifier: Property, ObjectType, ApplicationTags } = bacnet.enum;
+const MAX_ACTIVE_SCANS = 16;
+const MAX_DISCOVERY_OBJECTS = 10000;
 
 class BacnetClient extends EventEmitter {
     constructor(options = {}) {
@@ -17,19 +23,21 @@ class BacnetClient extends EventEmitter {
         this.queue = [];
         this.queuedDevices = new Set();
         this.inFlightDevices = new Set();
-        this.unitsUnsupportedObjects = new Set();
+        this.deviceUpdates = new Map();
+        this.polls = new Set();
+        this.scans = new Map();
+        this.requests = new BacnetRequests();
         this.activePolls = 0;
         this.closing = false;
 
-        const pollingConfig = config.has('polling') ? config.get('polling') : {};
-        this.globalConcurrency = parseInt(pollingConfig.globalConcurrency || 2, 10);
-        this.objectConcurrency = parseInt(pollingConfig.objectConcurrency || 4, 10);
-        this.schedulerTickMs = parseInt(pollingConfig.schedulerTickMs || 1000, 10);
-        this.defaultFreshnessMs = parseInt(pollingConfig.defaultFreshnessMs || 30000, 10);
-        this.failureThreshold = parseInt(pollingConfig.failureThreshold || 3, 10);
-        this.baseBackoffMs = parseInt(pollingConfig.baseBackoffMs || 5000, 10);
-        this.maxBackoffMs = parseInt(pollingConfig.maxBackoffMs || 120000, 10);
-        this.discoveryRetries = this._loadIntegerOption('bacnet.discoveryRetries', 2);
+        this.globalConcurrency = this._loadIntegerOption('polling.globalConcurrency', 2);
+        this.objectConcurrency = this._loadIntegerOption('polling.objectConcurrency', 4);
+        this.schedulerTickMs = this._loadIntegerOption('polling.schedulerTickMs', 1000);
+        this.defaultFreshnessMs = this._loadIntegerOption('polling.defaultFreshnessMs', 30000);
+        this.failureThreshold = this._loadIntegerOption('polling.failureThreshold', 3);
+        this.baseBackoffMs = this._loadIntegerOption('polling.baseBackoffMs', 5000);
+        this.maxBackoffMs = this._loadIntegerOption('polling.maxBackoffMs', 120000);
+        this.discoveryRetries = this._loadIntegerOption('bacnet.discoveryRetries', 2, 0);
 
         this.metrics = {
             totalPolls: 0,
@@ -45,35 +53,33 @@ class BacnetClient extends EventEmitter {
         this.runtimeState = options.runtimeState || new RuntimeState();
         this.bacnetConfig = options.bacnetConfig || new BacnetConfig();
 
-        this.client.on('iAm', (device) => {
-            this.emit('deviceFound', device);
-        });
+        this.onDeviceFound = (device) => {
+            if (!this.closing) this.emit('deviceFound', device);
+        };
+        this.onTransportError = (error) => logger.log('error', `[BACnet] Transport error: ${error.message}`);
+        this.client.on('iAm', this.onDeviceFound);
+        this.client.on('error', this.onTransportError);
 
+        this.onConfigLoaded = (deviceConfig) => this._registerDeviceConfig(deviceConfig).catch((error) => {
+            if (!this.closing) logger.log('error', `[Polling] Failed to register config: ${error.message}`);
+        });
+        this.schedulerHandle = null;
+        this.closePromise = null;
         this.ready = this._init();
-        this.schedulerHandle = setInterval(() => {
-            this._schedulerLoop().catch((err) => {
-                logger.log('error', `[Polling] Scheduler loop failed: ${err.message || err}`);
-            });
-        }, this.schedulerTickMs);
     }
 
     async _init() {
-        if (this.runtimeState && typeof this.runtimeState.init === 'function') {
-            await this.runtimeState.init();
+        await this.runtimeState.init();
+        if (this.closing) return;
+
+        // The loader awaits its listeners, so readiness includes every registration.
+        this.bacnetConfig.on('configLoaded', this.onConfigLoaded);
+        await this.bacnetConfig.load();
+        if (!this.closing) {
+            this.schedulerHandle = setInterval(() => {
+                this._schedulerLoop().catch((error) => logger.log('error', `[Polling] Scheduler failed: ${error.message}`));
+            }, this.schedulerTickMs);
         }
-        const initialRegistrations = [];
-        let loadingInitialConfigs = true;
-        this.bacnetConfig.on('configLoaded', (deviceConfig) => {
-            const registration = this._registerDeviceConfig(deviceConfig).catch((err) => {
-                logger.log('error', `[Polling] Failed to register config: ${err.message || err}`);
-            });
-            if (loadingInitialConfigs) {
-                initialRegistrations.push(registration);
-            }
-        });
-        await Promise.resolve(this.bacnetConfig.load());
-        loadingInitialConfigs = false;
-        await Promise.all(initialRegistrations);
     }
 
     _loadRequestOptions() {
@@ -115,32 +121,72 @@ class BacnetClient extends EventEmitter {
         return options;
     }
 
-    _loadIntegerOption(path, fallback) {
-        if (!config.has(path)) {
-            return fallback;
-        }
-        const value = parseInt(config.get(path), 10);
-        return Number.isNaN(value) ? fallback : value;
+    _loadIntegerOption(path, fallback, minimum = 1) {
+        const value = config.has(path) ? Number(config.get(path)) : fallback;
+        return Number.isSafeInteger(value) && value >= minimum ? value : fallback;
     }
 
-    async _registerDeviceConfig(deviceConfig) {
-        if (!deviceConfig || !deviceConfig.device || deviceConfig.device.deviceId === undefined) {
-            logger.log('warn', '[BacnetClient] Loaded a device config without a valid deviceId.');
-            return;
+    _withDeviceUpdate(deviceId, update) {
+        const previous = this.deviceUpdates.get(deviceId) || Promise.resolve();
+        const pending = previous.catch(() => {}).then(update).finally(() => {
+            if (this.deviceUpdates.get(deviceId) === pending) this.deviceUpdates.delete(deviceId);
+        });
+        this.deviceUpdates.set(deviceId, pending);
+        return pending;
+    }
+
+    async _registerDeviceConfig(deviceConfig, persist = false) {
+        if (this.closing) throw new BacnetUnavailableError('BACnet client is closing');
+        const errors = validateDeviceConfig(deviceConfig);
+        if (errors.length > 0) throw new TypeError(errors.join(' '));
+
+        deviceConfig = structuredClone(deviceConfig);
+        const deviceId = String(deviceConfig.device.deviceId);
+        return this._withDeviceUpdate(deviceId, async () => {
+            if (this.closing) throw new BacnetUnavailableError('BACnet client is closing');
+            const previous = this.deviceRuntime.get(deviceId);
+            const runtime = this._createRuntime(deviceConfig);
+            const job = this._prepareSchedule(runtime);
+
+            try {
+                if (persist) await this.bacnetConfig.save(deviceConfig);
+            } catch (error) {
+                job?.cancel();
+                throw error;
+            }
+
+            this.schedules.get(deviceId)?.cancel();
+            this.schedules.delete(deviceId);
+            if (job && !this.closing) this.schedules.set(deviceId, job);
+            else job?.cancel();
+
+            this.deviceConfigs.set(deviceId, deviceConfig);
+            this.deviceRuntime.set(deviceId, runtime);
+            const keys = runtime.objects.map(({ objectId }) => this._objectKey(objectId));
+            const addressChanged = previous && previous.address !== runtime.address;
+            runtime.pruneKeys = addressChanged ? [] : keys;
+            this.emit('configChanged', deviceId, runtime.pruneKeys);
+            await this._syncRuntimeConfig(runtime).catch((error) => {
+                // The config file is authoritative. Retry the derived SQLite update on the next poll.
+                logger.log('error', `[Polling] Failed to sync device ${deviceId}: ${error.message}`);
+            });
+        });
+    }
+
+    async _syncRuntimeConfig(runtime) {
+        if (!runtime.pruneKeys) return;
+        if (!runtime.checkedStoredAddress && this.runtimeState.getDeviceState) {
+            const stored = await this.runtimeState.getDeviceState(runtime.deviceId);
+            if (stored?.address && stored.address !== runtime.address) runtime.pruneKeys = [];
+            runtime.checkedStoredAddress = true;
         }
-
-        const deviceId = deviceConfig.device.deviceId.toString();
-        this.deviceConfigs.set(deviceId, deviceConfig);
-        const runtime = this._getOrCreateRuntime(deviceConfig.device, deviceConfig.polling);
-        const normalizedPolling = this._normalizePolling(deviceConfig.polling);
-        runtime.objects = Array.isArray(deviceConfig.objects) ? deviceConfig.objects : [];
-        runtime.polling = normalizedPolling;
-        runtime.pollClass = normalizedPolling.class;
-        runtime.schedule = normalizedPolling.schedule;
-        runtime.address = deviceConfig.device.address;
-
+        await this.runtimeState.pruneDeviceObjects?.(runtime.deviceId, runtime.pruneKeys);
         await this.runtimeState.upsertDeviceState(this._serializeRuntime(runtime));
-        this._configureSchedule(deviceId, runtime.polling);
+        runtime.pruneKeys = null;
+    }
+
+    _objectKey({ type, instance }) {
+        return `${Number(type)}_${Number(instance)}`;
     }
 
     _normalizePolling(polling = {}) {
@@ -163,28 +209,26 @@ class BacnetClient extends EventEmitter {
         return parseInt(classIntervals[polling.class || 'normal'] || classIntervals.normal || 15000, 10);
     }
 
-    _getOrCreateRuntime(device, polling = {}) {
-        const deviceId = device.deviceId.toString();
-        if (!this.deviceRuntime.has(deviceId)) {
-            this.deviceRuntime.set(deviceId, {
-                deviceId,
-                address: device.address,
-                pollClass: polling.class || 'normal',
-                schedule: polling.schedule || null,
-                nextDueAt: Date.now(),
-                nextEligiblePollAt: Date.now(),
-                consecutiveFailures: 0,
-                circuitState: 'closed',
-                lastAttemptAt: null,
-                lastSuccessAt: null,
-                lastDurationMs: null,
-                lastError: null,
-                cronDue: false,
-                objects: [],
-                polling: this._normalizePolling(polling)
-            });
-        }
-        return this.deviceRuntime.get(deviceId);
+    _createRuntime({ device, polling, objects }) {
+        const settings = this._normalizePolling(polling);
+        return {
+            deviceId: String(device.deviceId),
+            address: device.address,
+            pollClass: settings.class,
+            schedule: settings.schedule,
+            nextDueAt: Date.now() + Math.floor(Math.random() * settings.jitterMs),
+            nextEligiblePollAt: Date.now(),
+            consecutiveFailures: 0,
+            circuitState: 'closed',
+            lastAttemptAt: null,
+            lastSuccessAt: null,
+            lastDurationMs: null,
+            lastError: null,
+            cronDue: false,
+            objects,
+            polling: settings,
+            unsupportedUnits: new Set()
+        };
     }
 
     _serializeRuntime(runtime) {
@@ -203,29 +247,11 @@ class BacnetClient extends EventEmitter {
         };
     }
 
-    _configureSchedule(deviceId, polling) {
-        const existing = this.schedules.get(deviceId);
-        if (existing && existing.job) {
-            existing.job.cancel();
-        }
-        this.schedules.delete(deviceId);
-
-        if (polling.schedule) {
-            const job = scheduleJob(polling.schedule, () => {
-                const runtime = this.deviceRuntime.get(deviceId);
-                if (runtime) {
-                    runtime.cronDue = true;
-                }
-            });
-            this.schedules.set(deviceId, { job });
-            return;
-        }
-
-        const runtime = this.deviceRuntime.get(deviceId);
-        if (runtime) {
-            const jitter = polling.jitterMs > 0 ? Math.floor(Math.random() * polling.jitterMs) : 0;
-            runtime.nextDueAt = Date.now() + jitter;
-        }
+    _prepareSchedule(runtime) {
+        if (!runtime.schedule) return null;
+        const job = scheduleJob(runtime.schedule, () => { runtime.cronDue = true; });
+        if (!job) throw new TypeError('polling.schedule must be a valid cron expression.');
+        return job;
     }
 
     async _schedulerLoop() {
@@ -242,9 +268,6 @@ class BacnetClient extends EventEmitter {
                 continue;
             }
             if (runtime.nextEligiblePollAt && runtime.nextEligiblePollAt > now) {
-                continue;
-            }
-            if (runtime.circuitState === 'open' && runtime.nextEligiblePollAt > now) {
                 continue;
             }
 
@@ -279,21 +302,17 @@ class BacnetClient extends EventEmitter {
             }
             this.inFlightDevices.add(deviceId);
             this.activePolls += 1;
-            this._pollDevice(deviceId)
-                .catch((err) => {
-                    logger.log('error', `[Polling] Device poll failed for ${deviceId}: ${err.message || err}`);
-                })
+            const poll = this._pollDevice(deviceId)
+                .catch((error) => logger.log('error', `[Polling] Device poll failed for ${deviceId}: ${error.message}`))
                 .finally(() => {
+                    this.polls.delete(poll);
                     this.inFlightDevices.delete(deviceId);
                     this.activePolls -= 1;
                     if (!this.closing && this.queue.length > 0) {
-                        setImmediate(() => {
-                            this._drainQueue().catch((err) => {
-                                logger.log('error', `[Polling] Queue drain failed: ${err.message || err}`);
-                            });
-                        });
+                        return this._drainQueue().catch((error) => logger.log('error', `[Polling] Queue drain failed: ${error.message}`));
                     }
                 });
+            this.polls.add(poll);
         }
     }
 
@@ -305,16 +324,31 @@ class BacnetClient extends EventEmitter {
         }
 
         const startedAt = Date.now();
-        runtime.lastAttemptAt = startedAt;
-        runtime.nextEligiblePollAt = startedAt;
-        await this.runtimeState.upsertDeviceState(this._serializeRuntime(runtime));
-
-        const reads = await this._runWithConcurrency(runtime.objects, this.objectConcurrency, async (deviceObject) => {
-            const objectId = deviceObject.objectId;
-            const result = await this._readObjectPresentValue(deviceConfig.device.address, objectId.type, objectId.instance);
+        const reads = await this._runWithConcurrency(runtime.objects, this.objectConcurrency, async ({ objectId }) => {
+            const result = await this._readObjectPresentValue(
+                runtime.address, Number(objectId.type), Number(objectId.instance), runtime.unsupportedUnits
+            );
             return { objectId, result };
         });
 
+        if (this.closing) return;
+        await this._withDeviceUpdate(deviceId, async () => {
+            if (this.closing || this.deviceRuntime.get(deviceId) !== runtime) return;
+
+            if (reads.some(({ error, result }) => (error || result?.error) instanceof BacnetUnavailableError)) {
+                runtime.nextEligiblePollAt = Date.now() + this.schedulerTickMs;
+                if (runtime.schedule) runtime.cronDue = true;
+                else runtime.nextDueAt = runtime.nextEligiblePollAt;
+                return;
+            }
+            await this._syncRuntimeConfig(runtime);
+            await this._commitPoll(deviceConfig, runtime, startedAt, reads);
+        });
+    }
+
+    async _commitPoll(deviceConfig, runtime, startedAt, reads) {
+        const { deviceId } = runtime;
+        runtime.lastAttemptAt = startedAt;
         const completedAt = Date.now();
         const durationMs = completedAt - startedAt;
         this.metrics.totalPolls += 1;
@@ -326,33 +360,31 @@ class BacnetClient extends EventEmitter {
         let failureCount = 0;
         let pollErrorClass = null;
 
-        for (const entry of reads) {
-            const objectKey = `${entry.objectId.type}_${entry.objectId.instance}`;
-            if (entry.result.error || !entry.result.value || !entry.result.value.values || entry.result.value.values.length === 0) {
+        for (const { objectId, result, error } of reads) {
+            const properties = result?.value?.values?.[0]?.values;
+            const presentValue = this._findProperty(properties, Property.PRESENT_VALUE);
+            if (error || result?.error || !presentValue || presentValue.type === ApplicationTags.ERROR) {
                 failureCount += 1;
                 this.metrics.totalObjectFailures += 1;
-                if (entry.result.error && !pollErrorClass) {
-                    pollErrorClass = entry.result.error.message || 'bacnet_read_error';
-                }
+                pollErrorClass ||= (error || result?.error)?.message || 'present_value_unavailable';
                 continue;
             }
 
             successCount += 1;
             this.metrics.totalObjectsRead += 1;
-            const object = entry.result.value;
-            const presentValue = this._findValueById(object.values[0].values, bacnet.enum.PropertyIds.PROP_PRESENT_VALUE);
-            const objectName = this._findValueById(object.values[0].values, bacnet.enum.PropertyIds.PROP_OBJECT_NAME);
-            const units = this._findValueById(object.values[0].values, bacnet.enum.PropertyIds.PROP_UNITS);
+            const objectKey = this._objectKey(objectId);
+            const objectName = this._findValueById(properties, Property.OBJECT_NAME);
+            const units = this._findValueById(properties, Property.UNITS);
             const acquiredAt = completedAt;
             const freshnessMs = runtime.polling.freshnessMs;
 
             values[objectKey] = {
-                value: presentValue,
+                value: presentValue.value,
                 name: objectName,
                 units,
                 objectKey,
-                objectType: entry.objectId.type,
-                objectInstance: entry.objectId.instance,
+                objectType: Number(objectId.type),
+                objectInstance: Number(objectId.instance),
                 deviceId,
                 address: deviceConfig.device.address,
                 acquiredAt,
@@ -385,7 +417,7 @@ class BacnetClient extends EventEmitter {
                 createdAt: completedAt
             });
             await this.runtimeState.upsertDeviceState(this._serializeRuntime(runtime));
-            this.emit('values', deviceConfig.device, values);
+            if (!this.closing) this.emit('values', deviceConfig.device, values);
             return;
         }
 
@@ -423,10 +455,7 @@ class BacnetClient extends EventEmitter {
                 try {
                     results[current] = await worker(items[current], current);
                 } catch (err) {
-                    results[current] = {
-                        objectId: items[current].objectId,
-                        result: { error: err, value: null }
-                    };
+                    results[current] = { error: err };
                 }
             }
         });
@@ -434,47 +463,26 @@ class BacnetClient extends EventEmitter {
         return results;
     }
 
-    _readObjectList(deviceAddress, deviceId, callback) {
-        const requestArray = [{
-            objectId: { type: bacnet.enum.ObjectTypes.OBJECT_DEVICE, instance: deviceId },
-            properties: [
-                { id: bacnet.enum.PropertyIds.PROP_OBJECT_LIST }
-            ]
-        }];
-        this.client.readPropertyMultiple(deviceAddress, requestArray, this._buildRequestOptions(), callback);
-    }
-
-    _readObjectListOnce(deviceAddress, deviceId) {
-        return new Promise((resolve, reject) => {
-            this._readObjectList(deviceAddress, deviceId, (error, value) => {
-                if (error) {
-                    reject(error);
-                } else {
-                    resolve(value);
-                }
+    _readObjectList(deviceAddress, deviceId) {
+        return this._readObject(deviceAddress, ObjectType.DEVICE, Number(deviceId), [{ id: Property.OBJECT_LIST }])
+            .then(({ error, value }) => {
+                if (error) throw error;
+                return value;
             });
-        });
     }
 
     async _readObjectListWithRetry(deviceAddress, deviceId) {
         return this._retryDiscoveryRead(
-            () => this._readObjectListOnce(deviceAddress, deviceId),
+            () => this._readObjectList(deviceAddress, deviceId),
             `Object_List for ${deviceId}`
         );
     }
 
     _readObjectListArrayIndex(deviceAddress, deviceId, arrayIndex) {
-        return new Promise((resolve, reject) => {
-            const objectId = { type: bacnet.enum.ObjectTypes.OBJECT_DEVICE, instance: deviceId };
-            const options = this._buildRequestOptions();
-            options.arrayIndex = arrayIndex;
-            this.client.readProperty(deviceAddress, objectId, bacnet.enum.PropertyIds.PROP_OBJECT_LIST, options, (error, value) => {
-                if (error) {
-                    reject(error);
-                } else {
-                    resolve(value);
-                }
-            });
+        const objectId = { type: ObjectType.DEVICE, instance: Number(deviceId) };
+        const options = { ...this.requestOptions, arrayIndex };
+        return this.requests.submit((done) => {
+            this.client.readProperty(deviceAddress, objectId, Property.OBJECT_LIST, options, done);
         });
     }
 
@@ -491,16 +499,15 @@ class BacnetClient extends EventEmitter {
     }
 
     async _readObjectListByIndex(deviceAddress, deviceId, count) {
-        const indexes = Array.from({ length: count }, (_item, idx) => idx + 1);
-        const reads = await this._runWithConcurrency(indexes, this.objectConcurrency, async (arrayIndex) => {
-            const value = await this._readObjectListArrayIndexWithRetry(deviceAddress, deviceId, arrayIndex);
+        if (count > MAX_DISCOVERY_OBJECTS) throw new Error(`BACnet object list exceeds ${MAX_DISCOVERY_OBJECTS} entries`);
+        const indexes = Array.from({ length: count }, (_, index) => index + 1);
+        const objects = await this._runWithConcurrency(indexes, this.objectConcurrency, async (index) => {
+            const value = await this._readObjectListArrayIndexWithRetry(deviceAddress, deviceId, index);
             return this._extractIndexedObjectListEntry(value);
         });
-        const objects = reads.map((entry) => entry && entry.result ? entry.result : entry);
-        if (objects.some((object) => !object || object.error)) {
-            const failed = objects.find((object) => object && object.error);
-            throw failed.error || new Error('Failed to read complete BACnet object list by index');
-        }
+        const failed = objects.find((object) => object?.error);
+        if (failed) throw failed.error;
+        if (objects.some((object) => !object)) throw new Error('Failed to read complete BACnet object list by index');
         return this._dedupeObjectIds(objects);
     }
 
@@ -510,6 +517,7 @@ class BacnetClient extends EventEmitter {
             try {
                 return await readFn();
             } catch (error) {
+                if (error instanceof BacnetUnavailableError) throw error;
                 lastError = error;
                 if (attempt < this.discoveryRetries) {
                     logger.log('warn', `[Discovery] ${label} failed on attempt ${attempt + 1}/${this.discoveryRetries + 1}: ${error.message || error}`);
@@ -519,36 +527,24 @@ class BacnetClient extends EventEmitter {
         throw lastError;
     }
 
-    _readObject(deviceAddress, type, instance, properties) {
-        return new Promise((resolve) => {
-            const requestArray = [{
-                objectId: { type: type, instance: instance },
-                properties: properties
-            }];
-            this.client.readPropertyMultiple(deviceAddress, requestArray, this._buildRequestOptions(), (error, value) => {
-                resolve({
-                    error: error,
-                    value: value
-                });
+    async _readObject(deviceAddress, type, instance, properties) {
+        try {
+            const value = await this.requests.submit((done) => {
+                this.client.readPropertyMultiple(
+                    deviceAddress, [{ objectId: { type, instance }, properties }], this._buildRequestOptions(), done
+                );
             });
-        });
-    }
-
-    _readObjectFull(deviceAddress, type, instance) {
-        return this._readObject(deviceAddress, type, instance, [
-            { id: bacnet.enum.PropertyIds.PROP_OBJECT_IDENTIFIER },
-            { id: bacnet.enum.PropertyIds.PROP_OBJECT_NAME },
-            { id: bacnet.enum.PropertyIds.PROP_OBJECT_TYPE },
-            { id: bacnet.enum.PropertyIds.PROP_DESCRIPTION },
-            { id: bacnet.enum.PropertyIds.PROP_UNITS },
-            { id: bacnet.enum.PropertyIds.PROP_PRESENT_VALUE }
-        ]);
+            return { error: null, value };
+        } catch (error) {
+            return { error, value: null };
+        }
     }
 
     async _readObjectWithRetry(deviceAddress, type, instance, properties, label) {
         let lastResult = null;
         for (let attempt = 0; attempt <= this.discoveryRetries; attempt += 1) {
             const result = await this._readObject(deviceAddress, type, instance, properties);
+            if (result.error instanceof BacnetUnavailableError) throw result.error;
             if (!result.error) {
                 return result;
             }
@@ -560,27 +556,18 @@ class BacnetClient extends EventEmitter {
         return lastResult;
     }
 
-    _readObjectBasic(deviceAddress, type, instance) {
-        return this._readObject(deviceAddress, type, instance, [
-            { id: bacnet.enum.PropertyIds.PROP_OBJECT_IDENTIFIER },
-            { id: bacnet.enum.PropertyIds.PROP_OBJECT_NAME },
-            { id: bacnet.enum.PropertyIds.PROP_OBJECT_TYPE },
-            { id: bacnet.enum.PropertyIds.PROP_PRESENT_VALUE }
-        ]);
-    }
-
     async _readObjectDiscoveryDetails(deviceAddress, objectId) {
         const full = await this._readObjectWithRetry(
             deviceAddress,
             objectId.type,
             objectId.instance,
             [
-                { id: bacnet.enum.PropertyIds.PROP_OBJECT_IDENTIFIER },
-                { id: bacnet.enum.PropertyIds.PROP_OBJECT_NAME },
-                { id: bacnet.enum.PropertyIds.PROP_OBJECT_TYPE },
-                { id: bacnet.enum.PropertyIds.PROP_DESCRIPTION },
-                { id: bacnet.enum.PropertyIds.PROP_UNITS },
-                { id: bacnet.enum.PropertyIds.PROP_PRESENT_VALUE }
+                { id: Property.OBJECT_IDENTIFIER },
+                { id: Property.OBJECT_NAME },
+                { id: Property.OBJECT_TYPE },
+                { id: Property.DESCRIPTION },
+                { id: Property.UNITS },
+                { id: Property.PRESENT_VALUE }
             ],
             `full metadata ${objectId.type}/${objectId.instance}`
         );
@@ -594,10 +581,10 @@ class BacnetClient extends EventEmitter {
             objectId.type,
             objectId.instance,
             [
-                { id: bacnet.enum.PropertyIds.PROP_OBJECT_IDENTIFIER },
-                { id: bacnet.enum.PropertyIds.PROP_OBJECT_NAME },
-                { id: bacnet.enum.PropertyIds.PROP_OBJECT_TYPE },
-                { id: bacnet.enum.PropertyIds.PROP_PRESENT_VALUE }
+                { id: Property.OBJECT_IDENTIFIER },
+                { id: Property.OBJECT_NAME },
+                { id: Property.OBJECT_TYPE },
+                { id: Property.PRESENT_VALUE }
             ],
             `basic metadata ${objectId.type}/${objectId.instance}`
         );
@@ -612,28 +599,23 @@ class BacnetClient extends EventEmitter {
         };
     }
 
-    async _readObjectPresentValue(deviceAddress, type, instance) {
-        const baseProperties = [
-            { id: bacnet.enum.PropertyIds.PROP_PRESENT_VALUE },
-            { id: bacnet.enum.PropertyIds.PROP_OBJECT_NAME }
-        ];
-        const objectKey = `${deviceAddress}|${type}|${instance}`;
-        if (this.unitsUnsupportedObjects.has(objectKey)) {
-            return this._readObject(deviceAddress, type, instance, baseProperties);
-        }
-        const result = await this._readObject(deviceAddress, type, instance, [
-            ...baseProperties,
-            { id: bacnet.enum.PropertyIds.PROP_UNITS }
-        ]);
-        if (!result.error || !this._isUnknownPropertyError(result.error)) {
+    async _readObjectPresentValue(deviceAddress, type, instance, unsupportedUnits) {
+        const basic = [{ id: Property.PRESENT_VALUE }, { id: Property.OBJECT_NAME }];
+        const key = this._objectKey({ type, instance });
+        if (unsupportedUnits?.has(key)) return this._readObject(deviceAddress, type, instance, basic);
+
+        const result = await this._readObject(deviceAddress, type, instance, [...basic, { id: Property.UNITS }]);
+        if (!result.error) {
+            const units = this._findProperty(result.value?.values?.[0]?.values, Property.UNITS);
+            if (units?.type === ApplicationTags.ERROR && units.value?.errorClass === 2 && units.value?.errorCode === 32) {
+                unsupportedUnits?.add(key);
+            }
             return result;
         }
+        if (!this._isUnknownPropertyError(result.error)) return result;
 
-        logger.log('warn', `[Polling] Units property is not supported for ${type}/${instance}; retrying without units.`);
-        const fallback = await this._readObject(deviceAddress, type, instance, baseProperties);
-        if (!fallback.error) {
-            this.unitsUnsupportedObjects.add(objectKey);
-        }
+        const fallback = await this._readObject(deviceAddress, type, instance, basic);
+        if (!fallback.error) unsupportedUnits?.add(key);
         return fallback;
     }
 
@@ -642,14 +624,13 @@ class BacnetClient extends EventEmitter {
         return /unknown[\s_-]*property/i.test(message) || /class:\s*2\s*-\s*code:\s*32/i.test(message);
     }
 
+    _findProperty(properties, id) {
+        return properties?.find((property) => property.id === id)?.value?.[0];
+    }
+
     _findValueById(properties, id) {
-        const property = properties.find(function(element) {
-            return element.id === id;
-        });
-        if (property && property.value && property.value.length > 0) {
-            return property.value[0].value;
-        }
-        return null;
+        const property = this._findProperty(properties, id);
+        return property?.type === ApplicationTags.ERROR ? null : property?.value ?? null;
     }
 
     _buildMinimalObjectReadResult(objectId) {
@@ -657,18 +638,16 @@ class BacnetClient extends EventEmitter {
             values: [{
                 objectId,
                 values: [
-                    { id: bacnet.enum.PropertyIds.PROP_OBJECT_IDENTIFIER, value: [{ value: objectId }] },
-                    { id: bacnet.enum.PropertyIds.PROP_OBJECT_TYPE, value: [{ value: objectId.type }] }
+                    { id: Property.OBJECT_IDENTIFIER, value: [{ value: objectId }] },
+                    { id: Property.OBJECT_TYPE, value: [{ value: objectId.type }] }
                 ]
             }]
         };
     }
 
     _extractObjectListEntries(result) {
-        if (!result || !result.values || !result.values[0] || !result.values[0].values || !result.values[0].values[0]) {
-            return [];
-        }
-        const values = result.values[0].values[0].value;
+        const properties = result?.values?.[0]?.values;
+        const values = properties?.find(({ id }) => id === Property.OBJECT_LIST)?.value;
         if (!Array.isArray(values)) {
             return [];
         }
@@ -681,8 +660,8 @@ class BacnetClient extends EventEmitter {
         if (!result || !Array.isArray(result.values) || !result.values[0]) {
             return null;
         }
-        const count = parseInt(result.values[0].value, 10);
-        return Number.isFinite(count) && count >= 0 ? count : null;
+        const count = result.values[0].value;
+        return Number.isSafeInteger(count) && count >= 0 ? count : null;
     }
 
     _extractIndexedObjectListEntry(result) {
@@ -736,58 +715,68 @@ class BacnetClient extends EventEmitter {
         const deviceObjectId = new DeviceObjectId(objectInfo.type, objectInfo.instance);
 
         const objectProperties = object.values[0].values;
-        const name = this._findValueById(objectProperties, bacnet.enum.PropertyIds.PROP_OBJECT_NAME);
-        const description = this._findValueById(objectProperties, bacnet.enum.PropertyIds.PROP_DESCRIPTION);
-        const type = this._findValueById(objectProperties, bacnet.enum.PropertyIds.PROP_OBJECT_TYPE);
-        const units = this._findValueById(objectProperties, bacnet.enum.PropertyIds.PROP_UNITS);
-        const presentValue = this._findValueById(objectProperties, bacnet.enum.PropertyIds.PROP_PRESENT_VALUE);
+        const name = this._findValueById(objectProperties, Property.OBJECT_NAME);
+        const description = this._findValueById(objectProperties, Property.DESCRIPTION);
+        const type = this._findValueById(objectProperties, Property.OBJECT_TYPE);
+        const units = this._findValueById(objectProperties, Property.UNITS);
+        const presentValue = this._findValueById(objectProperties, Property.PRESENT_VALUE);
 
         return new DeviceObject(deviceObjectId, name, description, type, units, presentValue);
     }
 
     scanForDevices() {
+        if (this.closing) throw new BacnetUnavailableError('BACnet client is closing');
         this.client.whoIs();
     }
 
     scanDevice(device) {
-        return this._scanDevice(device);
+        if (this.closing) return Promise.reject(new BacnetUnavailableError('BACnet client is closing'));
+        const key = JSON.stringify([String(device.deviceId), device.address]);
+        if (this.scans.has(key)) return this.scans.get(key);
+        if (this.scans.size >= MAX_ACTIVE_SCANS) {
+            return Promise.reject(new BacnetUnavailableError('Too many active device scans'));
+        }
+        const pending = this._scanDevice(device).finally(() => this.scans.delete(key));
+        this.scans.set(key, pending);
+        return pending;
     }
 
     async _scanDevice(device) {
+        const { address, deviceId } = device;
+        let bulkError;
+        let objects = [];
         try {
-            const result = await this._readObjectListWithRetry(device.address, device.deviceId);
-            let objectArray = this._extractObjectListEntries(result);
-            let expectedCount = null;
-            try {
-                expectedCount = await this._readObjectListCount(device.address, device.deviceId);
-            } catch (countError) {
-                logger.log('warn', `[Discovery] Failed to read Object_List count for ${device.deviceId}: ${countError.message || countError}`);
-            }
-            if (expectedCount !== null && objectArray.length !== expectedCount) {
-                logger.log('warn', `[Discovery] Full Object_List returned ${objectArray.length}/${expectedCount} objects for ${device.deviceId}; retrying with indexed reads.`);
-                objectArray = await this._readObjectListByIndex(device.address, device.deviceId, expectedCount);
-            }
-            const scanItems = objectArray.map((objectId) => ({ objectId }));
-            const boundedReads = await this._runWithConcurrency(scanItems, this.objectConcurrency, async ({ objectId }) => {
-                try {
-                    return { result: await this._readObjectDiscoveryDetails(device.address, objectId) };
-                } catch (error) {
-                    return { error };
-                }
-            });
-            const failedRead = boundedReads.find((entry) => entry && entry.error);
-            if (failedRead) {
-                throw failedRead.error;
-            }
-            const resolved = boundedReads.map((entry) => entry.result);
-            const successfulResults = resolved.filter((element) => !element.error);
-            const deviceObjects = successfulResults.map((element) => this._mapToDeviceObject(element.value));
-            this.emit('deviceObjects', device, deviceObjects);
-            return deviceObjects;
+            const result = await this._readObjectListWithRetry(address, deviceId);
+            objects = this._extractObjectListEntries(result);
+            if (objects.length === 0) bulkError = new Error('BACnet bulk object list was empty or unavailable');
         } catch (error) {
-            logger.log('error', `Error whilte fetching objects: ${error}`);
-            throw error;
+            if (error instanceof BacnetUnavailableError) throw error;
+            bulkError = error;
         }
+
+        let count;
+        try {
+            count = await this._readObjectListCount(address, deviceId);
+        } catch (error) {
+            if (error instanceof BacnetUnavailableError) throw error;
+            if (bulkError) throw bulkError;
+            logger.log('warn', `[Discovery] Object list count unavailable for ${deviceId}: ${error.message}`);
+        }
+        if (Number.isSafeInteger(count) && (bulkError || count !== objects.length)) {
+            objects = await this._readObjectListByIndex(address, deviceId, count);
+        } else if (bulkError) {
+            throw bulkError;
+        }
+        if (objects.length > MAX_DISCOVERY_OBJECTS) throw new Error(`BACnet object list exceeds ${MAX_DISCOVERY_OBJECTS} entries`);
+
+        const reads = await this._runWithConcurrency(objects, this.objectConcurrency, async (objectId) => {
+            const details = await this._readObjectDiscoveryDetails(address, objectId);
+            return this._mapToDeviceObject(details.value) || this._mapToDeviceObject(this._buildMinimalObjectReadResult(objectId));
+        });
+        const failed = reads.find((entry) => entry?.error);
+        if (failed) throw failed.error;
+        if (!this.closing) this.emit('deviceObjects', device, reads);
+        return reads;
     }
 
     startPolling(device, objects, pollingOrSchedule) {
@@ -802,57 +791,38 @@ class BacnetClient extends EventEmitter {
         return this._registerDeviceConfig(deviceConfig);
     }
 
-    async saveConfig(deviceConfig) {
-        await this.bacnetConfig.save(deviceConfig);
-        return this._registerDeviceConfig(deviceConfig);
+    saveConfig(deviceConfig) {
+        return this._registerDeviceConfig(deviceConfig, true);
     }
 
-    writeProperty(deviceAddress, objectId, propertyId, valueToWrite, priority, bacnetApplicationTag) {
-        return new Promise((resolve, reject) => {
-            let bacnetValue = valueToWrite;
-            let bacnetType;
-
-            if (bacnetApplicationTag !== undefined && typeof bacnetApplicationTag === 'number') {
-                bacnetType = bacnetApplicationTag;
-                if (bacnetType === bacnet.enum.ApplicationTags.BACNET_APPLICATION_TAG_BOOLEAN) {
-                    bacnetValue = valueToWrite ? 1 : 0;
+    writeProperty(deviceAddress, objectId, propertyId, value, priority, bacnetApplicationTag, deviceId) {
+        let type = bacnetApplicationTag;
+        if (type === undefined) {
+            if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) value = Number(value);
+            if (typeof value === 'boolean') type = ApplicationTags.BOOLEAN;
+            else if (typeof value === 'string') type = ApplicationTags.CHARACTER_STRING;
+            else if (Number.isFinite(value)) type = Number.isInteger(value) ? ApplicationTags.SIGNED_INTEGER : ApplicationTags.REAL;
+            else return Promise.reject(new TypeError('Unsupported value type for BACnet write'));
+        }
+        if (type === ApplicationTags.BOOLEAN) {
+            if (typeof value === 'string') {
+                const text = value.trim().toLowerCase();
+                if (!['true', 'false', '1', '0'].includes(text)) {
+                    return Promise.reject(new TypeError('A BACnet boolean must be true, false, 1, or 0'));
                 }
-            } else {
-                if (typeof valueToWrite === 'number') {
-                    bacnetType = Number.isInteger(valueToWrite)
-                        ? bacnet.enum.ApplicationTags.BACNET_APPLICATION_TAG_SIGNED_INT
-                        : bacnet.enum.ApplicationTags.BACNET_APPLICATION_TAG_REAL;
-                } else if (typeof valueToWrite === 'boolean') {
-                    bacnetType = bacnet.enum.ApplicationTags.BACNET_APPLICATION_TAG_BOOLEAN;
-                    bacnetValue = valueToWrite ? 1 : 0;
-                } else if (typeof valueToWrite === 'string') {
-                    const numVal = parseFloat(valueToWrite);
-                    if (!isNaN(numVal)) {
-                        bacnetType = Number.isInteger(numVal)
-                            ? bacnet.enum.ApplicationTags.BACNET_APPLICATION_TAG_SIGNED_INT
-                            : bacnet.enum.ApplicationTags.BACNET_APPLICATION_TAG_REAL;
-                        bacnetValue = numVal;
-                    } else {
-                        bacnetType = bacnet.enum.ApplicationTags.BACNET_APPLICATION_TAG_CHARACTER_STRING;
-                    }
-                } else {
-                    reject(new Error(`Unsupported value type for BACnet write: ${typeof valueToWrite} (and no BACnetApplicationTag provided)`));
-                    return;
-                }
+                value = text === 'true' || text === '1';
             }
+            value = value ? 1 : 0;
+        }
 
-            const values = [{ type: bacnetType, value: bacnetValue }];
-            const options = this._buildRequestOptions(priority);
-
-            this.client.writeProperty(deviceAddress, objectId, propertyId, values, options, (err, val) => {
-                if (err) {
-                    logger.log('error', `[BACnet Write] Error writing property: ${err}`);
-                    reject(err);
-                } else {
-                    resolve(val);
-                }
-            });
-        });
+        const key = JSON.stringify([deviceAddress, objectId.type, objectId.instance, propertyId]);
+        return this.requests.submit((done) => {
+            if (deviceId !== undefined && this.deviceConfigs.get(String(deviceId))?.device.address !== deviceAddress) {
+                done(new BacnetUnavailableError('BACnet device address changed while the write was queued'));
+                return;
+            }
+            this.client.writeProperty(deviceAddress, objectId, propertyId, [{ type, value }], this._buildRequestOptions(priority), done);
+        }, key);
     }
 
     async listRuntimeStates() {
@@ -882,25 +852,30 @@ class BacnetClient extends EventEmitter {
         };
     }
 
-    async close() {
+    close(httpClosed) {
+        this.closePromise ??= this._close(httpClosed);
+        return this.closePromise;
+    }
+
+    async _close(httpClosed) {
         this.closing = true;
-        if (this.schedulerHandle) {
-            clearInterval(this.schedulerHandle);
-            this.schedulerHandle = null;
-        }
-        for (const entry of this.schedules.values()) {
-            if (entry && entry.job && typeof entry.job.cancel === 'function') {
-                entry.job.cancel();
-            }
-        }
+        clearInterval(this.schedulerHandle);
+        this.schedulerHandle = null;
+        this.bacnetConfig.removeListener('configLoaded', this.onConfigLoaded);
+        this.client.removeListener('iAm', this.onDeviceFound);
+        for (const job of this.schedules.values()) job.cancel();
         this.schedules.clear();
         this.queue.length = 0;
         this.queuedDevices.clear();
-        if (this.client && typeof this.client.close === 'function') {
-            this.client.close();
-        }
-        if (this.runtimeState && typeof this.runtimeState.close === 'function') {
-            await this.runtimeState.close();
+        this.requests.close();
+
+        try {
+            await this.client.close?.();
+        } finally {
+            await Promise.allSettled([this.ready, ...this.polls, ...this.scans.values(), ...this.deviceUpdates.values()]);
+            this.client.removeListener('error', this.onTransportError);
+            await httpClosed;
+            await this.runtimeState.close?.();
         }
     }
 }

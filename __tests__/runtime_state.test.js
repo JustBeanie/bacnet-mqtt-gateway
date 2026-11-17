@@ -156,4 +156,39 @@ describe('RuntimeState', () => {
         await expect(state.get('SELECT 1')).rejects.toThrow('get failed');
         await expect(state.all('SELECT 1')).rejects.toThrow('all failed');
     });
+    test('prunes an existing poll history by age and count while keeping current state', async () => {
+        const { RuntimeState } = require('../src/runtime_state');
+        state = new RuntimeState();
+        await state.init();
+        await state.historyCleanup;
+        const now = Date.now();
+        await state.run("INSERT INTO poll_history (device_id, status, created_at) VALUES (?, 'success', ?)", ['1', now - 8 * 86400000]);
+        await state.run(`WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM rows WHERE n < 100004)
+                        INSERT INTO poll_history (device_id, status, created_at) SELECT '1', 'success', ? FROM rows`, [now]);
+        await state.upsertDeviceState({ deviceId: '1', address: '10.0.0.1' });
+        await state.saveObjectTelemetry('1', '2_1', { value: 99 });
+        await state.close();
+
+        state = new RuntimeState();
+        await state.init();
+        await state.historyCleanup;
+        expect(await state.get('SELECT COUNT(*) AS count, MIN(created_at) AS oldest FROM poll_history'))
+            .toEqual({ count: 100000, oldest: now });
+        await expect(state.getLatestObjectState('1', '2_1')).resolves.toMatchObject({ value: 99 });
+    });
+
+    test('prunes retired objects for one device without touching another', async () => {
+        const { RuntimeState } = require('../src/runtime_state');
+        state = new RuntimeState();
+        await state.init();
+        await state.saveObjectTelemetry('1', '2_1', { value: 1 });
+        await state.saveObjectTelemetry('1', '2_2', { value: 2 });
+        await state.saveObjectTelemetry('2', '2_1', { value: 3 });
+
+        await state.pruneDeviceObjects('1', ['2_2']);
+
+        await expect(state.getLatestObjectState('1', '2_1')).resolves.toBeNull();
+        await expect(state.getLatestObjectState('1', '2_2')).resolves.toMatchObject({ value: 2 });
+        await expect(state.getLatestObjectState('2', '2_1')).resolves.toMatchObject({ value: 3 });
+    });
 });

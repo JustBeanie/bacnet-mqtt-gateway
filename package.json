@@ -1,10 +1,11 @@
 {
   "name": "bacnet-mqtt-gateway",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Home Assistant OS app for the production BACnet to MQTT gateway",
   "main": "src/app.js",
   "scripts": {
     "start": "node src/app.js",
+    "postinstall": "patch-package --error-on-fail",
     "reset-admin": "node scripts/reset-admin.js",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage"
@@ -38,6 +39,7 @@
     "jsonwebtoken": "^9.0.3",
     "mqtt": ">=5.16.1",
     "node-schedule": "^2.1.2",
+    "patch-package": "8.0.1",
     "sqlite3": "^6.0.1",
     "swagger-ui-express": "^5.0.1",
     "utf-8-validate": ">=6.0.6",

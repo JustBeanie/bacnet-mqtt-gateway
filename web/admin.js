@@ -90,13 +90,14 @@ const SessionVault = (() => {
     }
 
     return {
-        async saveSession(accessToken, refreshToken) {
-            const encryptedAccessToken = await encryptToken(accessToken);
+        async saveSession(accessToken, refreshToken, signal) {
+            const [encryptedAccessToken, encryptedRefreshToken] = await Promise.all([
+                encryptToken(accessToken), refreshToken ? encryptToken(refreshToken) : null
+            ]);
+            signal?.throwIfAborted();
             localStorage.setItem(ACCESS_TOKEN_KEY, encryptedAccessToken);
-            if (refreshToken) {
-                const encryptedRefreshToken = await encryptToken(refreshToken);
-                localStorage.setItem(REFRESH_TOKEN_KEY, encryptedRefreshToken);
-            }
+            if (encryptedRefreshToken) localStorage.setItem(REFRESH_TOKEN_KEY, encryptedRefreshToken);
+            else localStorage.removeItem(REFRESH_TOKEN_KEY);
         },
         async loadSession() {
             const legacyToken = localStorage.getItem(LEGACY_TOKEN_KEY);
@@ -104,8 +105,10 @@ const SessionVault = (() => {
                 localStorage.setItem(ACCESS_TOKEN_KEY, legacyToken);
                 localStorage.removeItem(LEGACY_TOKEN_KEY);
             }
-            const accessToken = await decryptToken(localStorage.getItem(ACCESS_TOKEN_KEY) || '');
-            const refreshToken = await decryptToken(localStorage.getItem(REFRESH_TOKEN_KEY) || '');
+            const [accessToken, refreshToken] = await Promise.all([
+                decryptToken(localStorage.getItem(ACCESS_TOKEN_KEY)),
+                decryptToken(localStorage.getItem(REFRESH_TOKEN_KEY))
+            ]);
             return { accessToken, refreshToken };
         },
         clear() {
@@ -133,6 +136,25 @@ function extractErrorMessage(error, fallback) {
     return (error.response && error.response.data && error.response.data.message) || error.message || fallback;
 }
 
+function cancelRequest(component, field) {
+    const controller = component[field];
+    component[field] = null;
+    controller?.abort();
+}
+
+function startRequest(component, field) {
+    cancelRequest(component, field);
+    const controller = new AbortController();
+    component[field] = controller;
+    return controller.signal;
+}
+
+function finishRequest(component, field, signal) {
+    if (component[field]?.signal !== signal) return false;
+    component[field] = null;
+    return true;
+}
+
 const Spinner = {
     template: '#spinner-template'
 };
@@ -143,37 +165,33 @@ const WhoisPanel = {
         return {
             loading: false,
             devices: [],
-            cancelTokenSource: null,
+            discoveryRequest: null,
             error: null
         };
     },
+    beforeUnmount() {
+        cancelRequest(this, 'discoveryRequest');
+    },
     methods: {
         async startScan() {
-            if (this.loading) {
-                return;
-            }
+            if (this.loading) return;
             this.loading = true;
             this.error = null;
             this.devices = [];
-            this.cancelTokenSource = axios.CancelToken.source();
+            const signal = startRequest(this, 'discoveryRequest');
             try {
-                const response = await axios.put('/api/bacnet/scan', {}, { cancelToken: this.cancelTokenSource.token });
-                this.devices = response.data || [];
+                const response = await axios.put('/api/bacnet/scan', {}, { signal });
+                if (!signal.aborted) this.devices = response.data || [];
             } catch (error) {
-                if (axios.isCancel(error)) {
-                    this.error = 'Scan stopped.';
-                } else {
-                    this.error = extractErrorMessage(error, 'Failed to scan BACnet network');
-                }
+                if (!signal.aborted) this.error = extractErrorMessage(error, 'Failed to scan BACnet network');
             } finally {
-                this.loading = false;
-                this.cancelTokenSource = null;
+                if (finishRequest(this, 'discoveryRequest', signal)) this.loading = false;
             }
         },
         stopScan() {
-            if (this.cancelTokenSource) {
-                this.cancelTokenSource.cancel('Scan stopped by user.');
-            }
+            cancelRequest(this, 'discoveryRequest');
+            this.loading = false;
+            this.error = 'Scan stopped.';
         }
     }
 };
@@ -191,6 +209,7 @@ const ObjectWriteForm = {
     data() {
         return {
             loading: false,
+            writeRequest: null,
             valueToWrite: '',
             propertyId: 85,
             priority: null,
@@ -217,8 +236,12 @@ const ObjectWriteForm = {
             ]
         };
     },
+    beforeUnmount() {
+        cancelRequest(this, 'writeRequest');
+    },
     methods: {
         async submitWrite() {
+            const signal = startRequest(this, 'writeRequest');
             this.loading = true;
             this.status = null;
             this.message = null;
@@ -239,15 +262,17 @@ const ObjectWriteForm = {
             }
 
             try {
-                const response = await axios.put('/api/bacnet/write', payload);
+                const response = await axios.put('/api/bacnet/write', payload, { signal });
+                if (signal.aborted) return;
                 this.status = 'success';
                 this.message = response.data.message || 'Write successful';
                 this.$emit('success');
             } catch (error) {
+                if (signal.aborted) return;
                 this.status = 'error';
                 this.message = extractErrorMessage(error, 'Failed to perform write operation');
             } finally {
-                this.loading = false;
+                if (finishRequest(this, 'writeRequest', signal)) this.loading = false;
             }
         }
     }
@@ -275,6 +300,9 @@ const DeviceScan = {
     data() {
         return {
             loading: false,
+            scanRequest: null,
+            diagnosticsRequest: null,
+            saveRequest: null,
             diagnosticsLoading: false,
             diagnosticsExpanded: false,
             diagnosticsFilter: 'all',
@@ -323,33 +351,63 @@ const DeviceScan = {
             };
         }
     },
+    watch: {
+        deviceId: { handler: 'clearScan', flush: 'sync' },
+        address: { handler: 'clearScan', flush: 'sync' }
+    },
+    beforeUnmount() {
+        this.resetDeviceRequests();
+    },
     methods: {
+        clearScan() {
+            this.resetDeviceRequests();
+            this.objects = [];
+            this.selectedObject = null;
+            this.configuredObjectKeys.clear();
+            this.runtimeObjectKeys.clear();
+            this.runtimeObjectsByKey = {};
+            this.error = null;
+            this.diagnosticsError = null;
+            this.saveError = null;
+            this.saveSuccess = null;
+        },
+        resetDeviceRequests() {
+            cancelRequest(this, 'scanRequest');
+            cancelRequest(this, 'diagnosticsRequest');
+            cancelRequest(this, 'saveRequest');
+            this.loading = false;
+            this.diagnosticsLoading = false;
+            this.saving = false;
+        },
         async scanDevice() {
+            this.resetDeviceRequests();
+            const signal = startRequest(this, 'scanRequest');
+            const { deviceId, address } = this;
             this.loading = true;
             this.error = null;
             this.saveError = null;
             this.saveSuccess = null;
             this.diagnosticsError = null;
             try {
-                const response = await axios.put(`/api/bacnet/${this.deviceId}/objects`, {
-                    deviceId: this.deviceId,
-                    address: this.address
-                });
+                const response = await axios.put(`/api/bacnet/${encodeURIComponent(deviceId)}/objects`, {
+                    deviceId, address
+                }, { signal });
+                if (signal.aborted || this.deviceId !== deviceId || this.address !== address) return;
                 this.objects = (response.data || []).map((object) => this.decorateObject({
                     ...object,
-                    selected: object && object.objectId && object.objectId.type !== 8
+                    selected: object?.objectId?.type !== 8
                 }));
                 await this.loadDiagnostics();
             } catch (error) {
+                if (signal.aborted) return;
                 this.objects = [];
                 this.error = extractErrorMessage(error, 'Failed to read BACnet device objects');
             } finally {
-                this.loading = false;
+                if (finishRequest(this, 'scanRequest', signal)) this.loading = false;
             }
         },
         loadDemoScan() {
-            this.loading = false;
-            this.diagnosticsLoading = false;
+            this.resetDeviceRequests();
             this.error = null;
             this.saveError = null;
             this.saveSuccess = null;
@@ -410,15 +468,19 @@ const DeviceScan = {
             if (!this.deviceId) {
                 return;
             }
+            const { deviceId, address } = this;
+            const signal = startRequest(this, 'diagnosticsRequest');
+            const isCurrent = () => !signal.aborted && this.deviceId === deviceId && this.address === address;
             this.diagnosticsLoading = true;
             this.diagnosticsError = null;
             try {
                 const [configuredResponse, runtimeResponse] = await Promise.all([
-                    axios.get('/api/bacnet/configured'),
-                    axios.get(`/api/bacnet/runtime-objects/${encodeURIComponent(this.deviceId)}`)
+                    axios.get('/api/bacnet/configured', { signal }),
+                    axios.get(`/api/bacnet/runtime-objects/${encodeURIComponent(deviceId)}`, { signal })
                 ]);
+                if (!isCurrent()) return;
                 const configuredDevice = (configuredResponse.data || []).find((device) => {
-                    return String(device.deviceId) === String(this.deviceId);
+                    return String(device.deviceId) === String(deviceId);
                 });
                 const configuredObjects = configuredDevice && Array.isArray(configuredDevice.objects)
                     ? configuredDevice.objects
@@ -432,13 +494,14 @@ const DeviceScan = {
                 }, {});
                 this.applyDiagnostics();
             } catch (error) {
+                if (!isCurrent()) return;
                 this.configuredObjectKeys = new Set();
                 this.runtimeObjectKeys = new Set();
                 this.runtimeObjectsByKey = {};
                 this.applyDiagnostics();
                 this.diagnosticsError = extractErrorMessage(error, 'Failed to load object diagnostics');
             } finally {
-                this.diagnosticsLoading = false;
+                if (finishRequest(this, 'diagnosticsRequest', signal)) this.diagnosticsLoading = false;
             }
         },
         async saveForPolling() {
@@ -461,8 +524,8 @@ const DeviceScan = {
                 ['freshnessMs', this.freshnessMs]
             ]) {
                 if (value !== '' && value !== null && value !== undefined) {
-                    const parsed = Number.parseInt(value, 10);
-                    if (!Number.isInteger(parsed) || parsed <= 0) {
+                    const parsed = Number(value);
+                    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
                         this.saveError = `${field} must be a positive integer.`;
                         return;
                     }
@@ -482,22 +545,25 @@ const DeviceScan = {
                 presentValue: object.presentValue
             }));
 
+            const signal = startRequest(this, 'saveRequest');
+            const { deviceId, address } = this;
             this.saving = true;
             try {
-                await axios.put(`/api/bacnet/${encodeURIComponent(this.deviceId)}/config`, {
-                    device: { deviceId: this.deviceId, address: this.address },
-                    polling,
-                    objects
-                });
+                await axios.put(`/api/bacnet/${encodeURIComponent(deviceId)}/config`, {
+                    device: { deviceId, address }, polling, objects
+                }, { signal });
+                if (signal.aborted || this.deviceId !== deviceId || this.address !== address) return;
+                cancelRequest(this, 'diagnosticsRequest');
+                this.diagnosticsLoading = false;
                 this.configuredObjectKeys = new Set(objects.map((object) => {
                     return `${object.objectId.type}_${object.objectId.instance}`;
                 }));
                 this.applyDiagnostics();
                 this.saveSuccess = `Saved ${objects.length} object${objects.length === 1 ? '' : 's'} for polling.`;
             } catch (error) {
-                this.saveError = extractErrorMessage(error, 'Failed to save polling configuration');
+                if (!signal.aborted) this.saveError = extractErrorMessage(error, 'Failed to save polling configuration');
             } finally {
-                this.saving = false;
+                if (finishRequest(this, 'saveRequest', signal)) this.saving = false;
             }
         },
         objectStatusLabels(object) {
@@ -546,21 +612,28 @@ const ConfiguredDevices = {
     data() {
         return {
             loading: false,
+            listRequest: null,
             devices: [],
             error: null
         };
     },
+    beforeUnmount() {
+        cancelRequest(this, 'listRequest');
+    },
     methods: {
         async load() {
+            const signal = startRequest(this, 'listRequest');
             this.loading = true;
             this.error = null;
             try {
-                const response = await axios.get('/api/bacnet/configured');
+                const response = await axios.get('/api/bacnet/configured', { signal });
+                if (signal.aborted) return;
                 this.devices = response.data || [];
             } catch (error) {
+                if (signal.aborted) return;
                 this.error = extractErrorMessage(error, 'Failed to load configured devices');
             } finally {
-                this.loading = false;
+                if (finishRequest(this, 'listRequest', signal)) this.loading = false;
             }
         }
     },
@@ -575,9 +648,13 @@ const RuntimeDevices = {
     data() {
         return {
             loading: false,
+            listRequest: null,
             devices: [],
             error: null
         };
+    },
+    beforeUnmount() {
+        cancelRequest(this, 'listRequest');
     },
     methods: {
         formatTimestamp(value) {
@@ -587,15 +664,18 @@ const RuntimeDevices = {
             return new Date(value).toLocaleString();
         },
         async load() {
+            const signal = startRequest(this, 'listRequest');
             this.loading = true;
             this.error = null;
             try {
-                const response = await axios.get('/api/bacnet/runtime');
+                const response = await axios.get('/api/bacnet/runtime', { signal });
+                if (signal.aborted) return;
                 this.devices = response.data || [];
             } catch (error) {
+                if (signal.aborted) return;
                 this.error = extractErrorMessage(error, 'Failed to load runtime device state');
             } finally {
-                this.loading = false;
+                if (finishRequest(this, 'listRequest', signal)) this.loading = false;
             }
         }
     },
@@ -610,11 +690,15 @@ const RuntimeObjects = {
     data() {
         return {
             loading: false,
+            listRequest: null,
             loaded: false,
             deviceId: '',
             objects: [],
             error: null
         };
+    },
+    beforeUnmount() {
+        cancelRequest(this, 'listRequest');
     },
     methods: {
         formatTimestamp(value) {
@@ -639,21 +723,27 @@ const RuntimeObjects = {
             return String(value);
         },
         async load() {
-            if (!this.deviceId) {
+            const { deviceId } = this;
+            if (!deviceId) {
                 return;
             }
+            const signal = startRequest(this, 'listRequest');
             this.loading = true;
             this.loaded = false;
             this.error = null;
             try {
-                const response = await axios.get(`/api/bacnet/runtime-objects/${encodeURIComponent(this.deviceId)}`);
+                const response = await axios.get(`/api/bacnet/runtime-objects/${encodeURIComponent(deviceId)}`, { signal });
+                if (signal.aborted || this.deviceId !== deviceId) return;
                 this.objects = response.data || [];
             } catch (error) {
+                if (signal.aborted) return;
                 this.objects = [];
                 this.error = extractErrorMessage(error, 'Failed to load runtime object state');
             } finally {
-                this.loaded = true;
-                this.loading = false;
+                if (finishRequest(this, 'listRequest', signal)) {
+                    this.loaded = true;
+                    this.loading = false;
+                }
             }
         }
     }
@@ -696,7 +786,15 @@ createApp({
             },
             changeError: null,
             changeSuccess: null,
-            refreshInFlight: null
+            refreshInFlight: null,
+            authRequest: null,
+            healthRequest: null,
+            passwordRequest: null,
+            healthTimer: null,
+            passwordTimer: null,
+            responseInterceptor: null,
+            disposed: false,
+            sessionVersion: 0
         };
     },
     computed: {
@@ -706,8 +804,17 @@ createApp({
     },
     methods: {
         async initAuth() {
+            const signal = startRequest(this, 'authRequest');
             try {
-                const modeResponse = await axios.get('/auth/mode');
+                await this.readAuthMode(signal);
+            } finally {
+                finishRequest(this, 'authRequest', signal);
+            }
+        },
+        async readAuthMode(signal) {
+            try {
+                const modeResponse = await axios.get('/auth/mode', { signal });
+                if (signal.aborted) return;
                 const mode = modeResponse.data || {};
                 this.trustIngress = mode.trustIngress === true;
                 if (this.trustIngress) {
@@ -722,11 +829,13 @@ createApp({
                     return;
                 }
             } catch (error) {
+                if (signal.aborted) return;
                 console.error('Failed to detect authentication mode', error);
                 this.trustIngress = false;
             }
 
             const session = await SessionVault.loadSession();
+            if (signal.aborted) return;
             if (!session.accessToken) {
                 this.tokenValid = false;
                 return;
@@ -735,10 +844,12 @@ createApp({
             const payload = parseJwt(session.accessToken);
             if (!payload || !payload.exp || payload.exp * 1000 < Date.now()) {
                 if (session.refreshToken) {
+                    const version = this.sessionVersion;
                     try {
                         await this.refreshSession(session.refreshToken);
                         return;
-                    } catch (_err) {
+                    } catch {
+                        if (this.disposed || this.sessionVersion !== version) return;
                     }
                 }
                 SessionVault.clear();
@@ -757,65 +868,68 @@ createApp({
             };
         },
         async refreshSession(explicitRefreshToken) {
-            if (this.refreshInFlight) {
-                return this.refreshInFlight;
-            }
-
-            this.refreshInFlight = (async () => {
+            if (this.refreshInFlight) return this.refreshInFlight;
+            const signal = startRequest(this, 'authRequest');
+            const pending = (async () => {
                 const session = await SessionVault.loadSession();
+                signal.throwIfAborted();
                 const refreshToken = explicitRefreshToken || session.refreshToken;
-                if (!refreshToken) {
-                    throw new Error('Missing refresh token');
-                }
+                if (!refreshToken) throw new Error('Missing refresh token');
 
-                const response = await axios.create({ baseURL: appBasePath }).post('/auth/refresh', { refreshToken });
+                const client = axios.create({ baseURL: appBasePath });
+                const response = await client.post('/auth/refresh', { refreshToken }, { signal });
                 const accessToken = response.data.token;
-                const nextRefreshToken = response.data.refreshToken || refreshToken;
                 const payload = parseJwt(accessToken);
-                if (!payload) {
-                    throw new Error('Invalid token received');
-                }
+                if (!payload) throw new Error('Invalid token received');
 
-                await SessionVault.saveSession(accessToken, nextRefreshToken);
+                await SessionVault.saveSession(accessToken, response.data.refreshToken || refreshToken, signal);
+                signal.throwIfAborted();
                 this.setAuth(accessToken, payload);
                 return accessToken;
             })();
 
+            this.refreshInFlight = pending;
             try {
-                return await this.refreshInFlight;
+                return await pending;
             } finally {
-                this.refreshInFlight = null;
+                finishRequest(this, 'authRequest', signal);
+                if (this.refreshInFlight === pending) this.refreshInFlight = null;
             }
         },
         async login() {
+            const signal = startRequest(this, 'authRequest');
+            this.sessionVersion += 1;
             this.loginLoading = true;
             this.loginError = null;
-
             try {
                 const response = await axios.post('/auth/login', {
                     username: this.loginForm.username,
                     password: this.loginForm.password
-                });
+                }, { signal });
                 const token = response.data.token;
                 const payload = parseJwt(token);
-                if (!payload) {
-                    throw new Error('Invalid token received');
-                }
+                if (!payload) throw new Error('Invalid token received');
 
-                await SessionVault.saveSession(token, response.data.refreshToken);
+                await SessionVault.saveSession(token, response.data.refreshToken, signal);
+                signal.throwIfAborted();
                 this.setAuth(token, payload);
                 this.loginForm.password = '';
             } catch (error) {
+                if (signal.aborted) return;
                 this.loginError = extractErrorMessage(error, 'Login failed');
                 SessionVault.clear();
             } finally {
-                this.loginLoading = false;
+                if (finishRequest(this, 'authRequest', signal)) this.loginLoading = false;
             }
         },
         logout() {
-            if (this.trustIngress) {
-                return;
-            }
+            if (this.trustIngress) return;
+            this.sessionVersion += 1;
+            cancelRequest(this, 'authRequest');
+            cancelRequest(this, 'passwordRequest');
+            clearTimeout(this.passwordTimer);
+            this.refreshInFlight = null;
+            this.loginLoading = false;
             SessionVault.clear();
             delete axios.defaults.headers.common.Authorization;
             this.tokenValid = false;
@@ -826,8 +940,11 @@ createApp({
             this.state = name;
         },
         async loadHealth() {
+            if (this.disposed || this.healthRequest) return;
+            const signal = startRequest(this, 'healthRequest');
             try {
-                const response = await axios.get('/health');
+                const response = await axios.get('/health', { signal, timeout: 10000 });
+                if (signal.aborted) return;
                 const data = response.data || {};
                 this.health = {
                     status: data.status || 'unknown',
@@ -835,13 +952,16 @@ createApp({
                     bacnet: data.bacnet || { configuredDevices: 0 },
                     runtime: data.runtime || { openCircuits: 0, staleObjects: 0, degradedDevices: 0 }
                 };
-            } catch (_error) {
+            } catch {
+                if (signal.aborted) return;
                 this.health = {
                     status: 'degraded',
                     mqtt: { connected: false },
                     bacnet: { configuredDevices: 0 },
                     runtime: { openCircuits: 0, staleObjects: 0, degradedDevices: 0 }
                 };
+            } finally {
+                finishRequest(this, 'healthRequest', signal);
             }
         },
         openChangePassword() {
@@ -854,64 +974,74 @@ createApp({
             this.changeForm = { oldPassword: '', newPassword: '' };
         },
         closeChangePassword() {
+            cancelRequest(this, 'passwordRequest');
+            clearTimeout(this.passwordTimer);
             this.changePasswordModal = false;
             this.changeError = null;
             this.changeSuccess = null;
         },
         async submitChangePassword() {
+            const signal = startRequest(this, 'passwordRequest');
+            clearTimeout(this.passwordTimer);
             this.changeError = null;
             this.changeSuccess = null;
             try {
                 await axios.post('/auth/change-password', {
                     oldPassword: this.changeForm.oldPassword,
                     newPassword: this.changeForm.newPassword
-                });
+                }, { signal });
+                if (signal.aborted) return;
                 this.changeSuccess = 'Password updated. Please log in again.';
-                window.setTimeout(() => {
+                this.passwordTimer = window.setTimeout(() => {
                     this.closeChangePassword();
                     this.logout();
                 }, 900);
             } catch (error) {
-                this.changeError = extractErrorMessage(error, 'Failed to change password');
+                if (!signal.aborted) this.changeError = extractErrorMessage(error, 'Failed to change password');
+            } finally {
+                finishRequest(this, 'passwordRequest', signal);
             }
         }
     },
+    beforeUnmount() {
+        this.disposed = true;
+        clearInterval(this.healthTimer);
+        clearTimeout(this.passwordTimer);
+        cancelRequest(this, 'authRequest');
+        cancelRequest(this, 'healthRequest');
+        cancelRequest(this, 'passwordRequest');
+        axios.interceptors.response.eject(this.responseInterceptor);
+    },
     async mounted() {
-        axios.interceptors.response.use(
+        this.responseInterceptor = axios.interceptors.response.use(
             (response) => response,
             async (error) => {
-                if (this.trustIngress) {
-                    return Promise.reject(error);
-                }
                 const originalRequest = error.config || {};
                 const requestUrl = originalRequest.url || '';
+                if (this.disposed || this.trustIngress || originalRequest.signal?.aborted
+                    || error.response?.status !== 401 || requestUrl.includes('/auth/')) throw error;
 
-                if (
-                    error.response &&
-                    error.response.status === 401 &&
-                    !originalRequest._retry &&
-                    !requestUrl.includes('/auth/login') &&
-                    !requestUrl.includes('/auth/refresh')
-                ) {
-                    originalRequest._retry = true;
-                    try {
-                        const token = await this.refreshSession();
-                        originalRequest.headers = originalRequest.headers || {};
-                        originalRequest.headers.Authorization = `Bearer ${token}`;
-                        return axios(originalRequest);
-                    } catch (_refreshError) {
-                        this.logout();
-                    }
-                } else if (error.response && error.response.status === 401) {
+                if (originalRequest._retry) {
                     this.logout();
+                    throw error;
                 }
 
-                return Promise.reject(error);
+                const version = this.sessionVersion;
+                originalRequest._retry = true;
+                try {
+                    const token = await this.refreshSession();
+                    if (this.disposed || this.sessionVersion !== version || originalRequest.signal?.aborted) throw error;
+                    originalRequest.headers = originalRequest.headers || {};
+                    originalRequest.headers.Authorization = `Bearer ${token}`;
+                    return axios(originalRequest);
+                } catch {
+                    if (!this.disposed && !originalRequest.signal?.aborted && this.sessionVersion === version) this.logout();
+                    throw error;
+                }
             }
         );
 
-        await this.initAuth();
-        await this.loadHealth();
-        window.setInterval(() => this.loadHealth(), 15000);
+        this.healthTimer = window.setInterval(() => this.loadHealth(), 15000);
+        await Promise.all([this.initAuth(), this.loadHealth()]);
     }
 }).mount('#app');

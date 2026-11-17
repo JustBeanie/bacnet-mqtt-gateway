@@ -4,16 +4,39 @@ const sqlite3 = require('sqlite3').verbose();
 const config = require('config');
 const { logger } = require('./common');
 
+const POLL_HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const POLL_HISTORY_MAX_ROWS = 100000;
+const POLL_HISTORY_BATCH_SIZE = 1000;
+const POLL_HISTORY_CLEANUP_INTERVAL_MS = 60000;
+
 class RuntimeState {
     constructor() {
         const runtimeCfg = config.has('runtime') ? config.get('runtime') : {};
         this.dbPath = path.resolve(runtimeCfg.dbPath || './data/runtime.db');
         this.db = null;
+        this.initPromise = null;
+        this.closePromise = null;
+        this.historyCleanup = null;
+        this.historyTimer = null;
     }
 
-    async init() {
+    init() {
+        if (this.closePromise) {
+            return Promise.reject(new Error('Runtime state is closed'));
+        }
+        this.initPromise ??= this._init();
+        return this.initPromise;
+    }
+
+    async _init() {
         await this._openDb();
         await this._migrate();
+        // Clean in the background so an older installation with a large history can start.
+        if (!this.closePromise) {
+            this._maintainPollHistory();
+            this.historyTimer = setInterval(() => this._maintainPollHistory(), POLL_HISTORY_CLEANUP_INTERVAL_MS);
+            this.historyTimer.unref();
+        }
         return this;
     }
 
@@ -76,6 +99,7 @@ class RuntimeState {
             );
             CREATE INDEX IF NOT EXISTS idx_poll_history_device_created_at
                 ON poll_history(device_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_poll_history_created_at ON poll_history(created_at);
         `;
 
         return new Promise((resolve, reject) => {
@@ -197,6 +221,13 @@ class RuntimeState {
         );
     }
 
+    pruneDeviceObjects(deviceId, objectKeys) {
+        return this.run(
+            'DELETE FROM object_state WHERE device_id = ? AND object_key NOT IN (SELECT value FROM json_each(?))',
+            [deviceId, JSON.stringify(objectKeys)]
+        );
+    }
+
     async recordPollHistory(entry) {
         await this.run(
             `
@@ -215,6 +246,34 @@ class RuntimeState {
                 entry.createdAt || Date.now()
             ]
         );
+    }
+
+    _maintainPollHistory() {
+        if (this.closePromise || this.historyCleanup) return;
+        this.historyCleanup = this.prunePollHistory()
+            .catch((error) => logger.log('warn', `[RuntimeState] Poll history cleanup failed: ${error.message}`))
+            .finally(() => { this.historyCleanup = null; });
+    }
+
+    async prunePollHistory(now = Date.now()) {
+        const oldest = now - POLL_HISTORY_MAX_AGE_MS;
+        const excess = await this.get(
+            'SELECT id FROM poll_history ORDER BY id DESC LIMIT 1 OFFSET ?',
+            [POLL_HISTORY_MAX_ROWS]
+        );
+        const filters = [['created_at', '<', oldest]];
+        if (excess) filters.push(['id', '<=', excess.id]);
+
+        for (const [column, operator, cutoff] of filters) {
+            while (!this.closePromise) {
+                const { changes } = await this.run(
+                    `DELETE FROM poll_history WHERE id IN
+                     (SELECT id FROM poll_history WHERE ${column} ${operator} ? ORDER BY ${column} LIMIT ?)`,
+                    [cutoff, POLL_HISTORY_BATCH_SIZE]
+                );
+                if (changes < POLL_HISTORY_BATCH_SIZE) break;
+            }
+        }
     }
 
     getDeviceState(deviceId) {
@@ -269,14 +328,21 @@ class RuntimeState {
     }
 
     close() {
-        if (!this.db) {
-            return Promise.resolve();
-        }
-        return new Promise((resolve, reject) => {
-            const db = this.db;
-            this.db = null;
-            db.close((err) => err ? reject(err) : resolve());
+        this.closePromise ??= this._close();
+        return this.closePromise;
+    }
+
+    async _close() {
+        await this.initPromise?.catch(() => {});
+        clearInterval(this.historyTimer);
+        this.historyTimer = null;
+        await this.historyCleanup;
+        if (!this.db) return;
+        const db = this.db;
+        await new Promise((resolve, reject) => {
+            db.close((error) => error ? reject(error) : resolve());
         });
+        this.db = null;
     }
 }
 

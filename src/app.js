@@ -81,80 +81,60 @@ function createApplication(options = {}) {
     const httpServerEnabled = configBoolean(configProvider, 'httpServer.enabled');
     const trustIngress = configBoolean(configProvider, 'auth.trustIngress');
 
-    // Preserve the original startup order: MQTT and BACnet begin connecting,
-    // then BACnet readiness gates auth initialization and the HTTP server.
+    const authService = trustIngress ? null : (options.authService || new AuthServiceClass());
     const mqttClient = options.mqttClient || new MqttClientClass();
     const bacnetClient = options.bacnetClient || new BacnetClientClass();
-    const authService = trustIngress
-        ? null
-        : (options.authService || new AuthServiceClass());
 
     let server = null;
     let shuttingDown = false;
     let shutdownPromise = null;
 
-    bacnetClient.on('deviceFound', (device) => {
-        mqttClient.publishMessage(device);
-    });
+    let initPromise;
+    let authInitialization;
 
-    bacnetClient.on('values', (device, values) => {
-        mqttClient.publishMessage(values);
-    });
-
-    mqttClient.on('bacnetWriteCommand', (command) => {
+    const onDeviceFound = (device) => mqttClient.publishMessage(device);
+    const onValues = (_device, values) => mqttClient.publishMessage(values);
+    const onConfigChanged = (deviceId, objectKeys) => mqttClient.pruneDevicePublishes?.(deviceId, objectKeys);
+    const onWriteCommand = async (command) => {
         const { deviceId, objectKey, objectType, objectInstance, propertyId, value, priority, bacnetApplicationTag } = command;
-        const targetDeviceConfig = bacnetClient.deviceConfigs.get(deviceId.toString());
-
-        if (targetDeviceConfig && targetDeviceConfig.device && targetDeviceConfig.device.address) {
-            const targetDeviceAddress = targetDeviceConfig.device.address;
-            const bacnetObjectId = { type: objectType, instance: objectInstance };
-            // Construct status topic using the new structure elements
-            // Example: bacnetwrite_status/<gatewayId>/<deviceId>/<objectKey>/<propertyId>
-            const gatewayIdForTopic = configProvider.get('mqtt.gatewayId');
-            const writeStatusTopic = `bacnetwrite_status/${gatewayIdForTopic}/${deviceId}/${objectKey}/${propertyId}`;
-
-            bacnetClient.writeProperty(targetDeviceAddress, bacnetObjectId, propertyId, value, priority, bacnetApplicationTag)
-                .then(response => {
-                    const successMsg = `[App] BACnet write successful for DeviceID: ${deviceId}, ObjectKey: ${objectKey}, Property: ${propertyId}: ${JSON.stringify(response)} (Priority: ${priority}, AppTag: ${bacnetApplicationTag})`;
-
-                    mqttClient.publishWriteStatus(writeStatusTopic, {
-                        status: 'success', detail: successMsg, writtenValue: value
-                    });
-                })
-                .catch(error => {
-                    const errorMsg = `[App] BACnet write failed for DeviceID: ${deviceId}, ObjectKey: ${objectKey}, Property: ${propertyId}: ${error.message || error}`;
-                    appLogger.log('error', errorMsg);
-                    mqttClient.publishWriteStatus(writeStatusTopic, {
-                        status: 'error', detail: errorMsg, attemptedValue: value
-                    });
-                });
-        } else {
-            appLogger.log('warn', `[App] Could not find a configured device for DeviceID ${deviceId} (from topic) to perform write operation for objectKey ${objectKey}.`);
-            const gatewayIdForTopic = configProvider.get('mqtt.gatewayId');
-            const statusTopic = `bacnetwrite_status/${gatewayIdForTopic}/${deviceId || 'unknown_device'}/${objectKey}/${propertyId || 'unknown_property'}`;
-            mqttClient.publishWriteStatus(statusTopic, {
-                status: 'error', detail: `Device configuration not found for DeviceID ${deviceId}`
+        const gatewayId = configProvider.get('mqtt.gatewayId');
+        const topic = `bacnetwrite_status/${gatewayId}/${deviceId}/${objectKey}/${propertyId}`;
+        const address = bacnetClient.deviceConfigs.get(String(deviceId))?.device.address;
+        try {
+            if (!address) throw new Error(`Device configuration not found for DeviceID ${deviceId}`);
+            const response = await bacnetClient.writeProperty(
+                address, { type: objectType, instance: objectInstance }, propertyId, value, priority, bacnetApplicationTag, deviceId
+            );
+            if (!shuttingDown) mqttClient.publishWriteStatus(topic, {
+                status: 'success', detail: `BACnet write successful: ${JSON.stringify(response)}`, writtenValue: value
             });
+        } catch (error) {
+            if (shuttingDown) return;
+            const detail = `BACnet write failed: ${error.message}`;
+            appLogger.log('warn', `[App] ${detail}`);
+            mqttClient.publishWriteStatus(topic, { status: 'error', detail, attemptedValue: value });
         }
-    });
+    };
+    bacnetClient.on('deviceFound', onDeviceFound);
+    bacnetClient.on('values', onValues);
+    bacnetClient.on('configChanged', onConfigChanged);
+    mqttClient.on('bacnetWriteCommand', onWriteCommand);
 
-    async function init() {
+    function init() {
+        initPromise ??= start();
+        return initPromise;
+    }
+
+    async function start() {
         await bacnetClient.ready;
-        if (shuttingDown) {
-            return;
-        }
-
+        if (shuttingDown) return;
         if (authService) {
-            const seededPassword = await authService.init();
-            if (seededPassword) {
-                deliverPassword('admin', seededPassword);
-            }
+            authInitialization = Promise.resolve(authService.init()).then((seededPassword) => {
+                if (seededPassword) deliverPassword('admin', seededPassword);
+            });
+            await authInitialization;
         }
-        if (shuttingDown) {
-            return;
-        }
-
-        if (httpServerEnabled) {
+        if (!shuttingDown && httpServerEnabled) {
             server = new ServerClass(bacnetClient, mqttClient, authService);
         }
     }
@@ -188,38 +168,41 @@ function createApplication(options = {}) {
         shuttingDown = true;
         appLogger.log('info', `[App] Shutting down: ${reason}`);
 
-        const closers = [
-            ['HTTP server', closeHttpServer],
-            ['MQTT client', closeMqttClient],
-            ['BACnet client and runtime state', () => invokeClose(bacnetClient, 'close')],
-            ['auth service', () => invokeClose(authService, 'close')]
-        ];
-        const cleanup = Promise.all(closers.map(async ([name, close]) => {
+        bacnetClient.removeListener('deviceFound', onDeviceFound);
+        bacnetClient.removeListener('values', onValues);
+        bacnetClient.removeListener('configChanged', onConfigChanged);
+        mqttClient.removeListener('bacnetWriteCommand', onWriteCommand);
+
+        async function closeResource(name, close) {
             try {
                 await close();
             } catch (error) {
                 appLogger.log('error', `[App] Failed to close ${name}: ${formatError(error)}`);
             }
-        }));
+        }
+
+        const httpClosed = closeResource('HTTP server', closeHttpServer);
+        const cleanup = Promise.all([
+            httpClosed,
+            closeResource('MQTT client', closeMqttClient),
+            closeResource('BACnet client and runtime state', () => invokeClose(bacnetClient, 'close', [httpClosed])),
+            closeResource('auth service', async () => {
+                await httpClosed;
+                await authInitialization?.catch(() => {});
+                await invokeClose(authService, 'close');
+            })
+        ]);
 
         shutdownPromise = new Promise((resolve) => {
-            let finished = false;
-            const finish = () => {
-                if (finished) {
-                    return;
-                }
-                finished = true;
-                clearTimeout(timeoutHandle);
-                resolve();
-            };
-            const timeoutHandle = setTimeout(() => {
+            const deadline = setTimeout(() => {
                 appLogger.log('error', `[App] Shutdown timed out after ${shutdownTimeoutMs}ms`);
-                finish();
+                server?.forceClose?.();
+                resolve();
             }, shutdownTimeoutMs);
-
             cleanup.then(() => {
+                clearTimeout(deadline);
                 appLogger.log('info', '[App] Shutdown complete');
-                finish();
+                resolve();
             });
         });
 
@@ -263,24 +246,20 @@ function runApplication(options = {}) {
                     appLogger.log('error', `[App] Shutdown failed: ${formatError(shutdownError)}`);
                 })
                 .then(() => {
+                    for (const [event, handler] of Object.entries(handlers)) processRef.removeListener(event, handler);
                     processRef.exit(requestedExitCode);
                 });
         }
         return terminationPromise;
     };
 
-    processRef.once('SIGTERM', () => {
-        void requestStop('SIGTERM');
-    });
-    processRef.once('SIGINT', () => {
-        void requestStop('SIGINT');
-    });
-    processRef.once('unhandledRejection', (reason) => {
-        void requestStop('unhandled rejection', 1, reason);
-    });
-    processRef.once('uncaughtException', (error) => {
-        void requestStop('uncaught exception', 1, error);
-    });
+    const handlers = {
+        SIGTERM: () => { void requestStop('SIGTERM'); },
+        SIGINT: () => { void requestStop('SIGINT'); },
+        unhandledRejection: (reason) => { void requestStop('unhandled rejection', 1, reason); },
+        uncaughtException: (error) => { void requestStop('uncaught exception', 1, error); }
+    };
+    for (const [event, handler] of Object.entries(handlers)) processRef.on(event, handler);
 
     const initPromise = Promise.resolve()
         .then(() => application.init())

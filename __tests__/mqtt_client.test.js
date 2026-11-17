@@ -396,4 +396,63 @@ describe('MqttClient', () => {
             rejectUnauthorized: false
         }));
     });
+    test('stalled acknowledgments cap in-flight messages and coalesce the pending value', async () => {
+        const { MqttClient } = require('../src/mqtt_client');
+        const client = new MqttClient();
+        const acks = [];
+        mqttMocks.publishMock.mockImplementation((_topic, _message, _options, ack) => { acks.push(ack); });
+        mqttMocks.clientInstance.emit('connect');
+        acks.shift()();
+        mqttMocks.publishMock.mockClear();
+
+        for (let id = 0; id < 40; id++) client.publishMessage({ deviceId: id, address: 'old' });
+        client.publishMessage({ deviceId: 39, address: 'new' });
+
+        expect(mqttMocks.publishMock).toHaveBeenCalledTimes(32);
+        expect(client.getStatus()).toMatchObject({ pendingPublishCount: 8, inFlightPublishCount: 32 });
+        for (let acked = 0; acked < 8; acked++) acks.shift()();
+        expect(client.getStatus()).toMatchObject({ pendingPublishCount: 0, inFlightPublishCount: 32 });
+        expect(mqttMocks.publishMock).toHaveBeenLastCalledWith(
+            'bacnet-gateway/test-gw/device_found/39', '{"deviceId":39,"address":"new"}',
+            { qos: 1, retain: true }, expect.any(Function)
+        );
+
+        while (acks.length) acks.shift()();
+        const close = client.close();
+        expect(client.close()).toBe(close);
+        acks.shift()();
+        await close;
+        expect(client.getStatus().inFlightPublishCount).toBe(0);
+    });
+
+    test('forces disconnect within two seconds when offline availability cannot be acknowledged', async () => {
+        jest.useFakeTimers();
+        try {
+            const { MqttClient } = require('../src/mqtt_client');
+            const client = new MqttClient();
+            mqttMocks.clientInstance.emit('connect');
+            mqttMocks.publishMock.mockImplementation(() => {});
+            const closed = client.close();
+            await jest.advanceTimersByTimeAsync(2000);
+            await closed;
+
+            expect(mqttMocks.endMock).toHaveBeenCalledWith(true, {}, expect.any(Function));
+            expect(mqttMocks.clientInstance.listenerCount('message')).toBe(0);
+            expect(client.getStatus().inFlightPublishCount).toBe(0);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    test('retired points are neither replayed nor left in the pending buffer', async () => {
+        const { MqttClient } = require('../src/mqtt_client');
+        const client = new MqttClient();
+        client.publishMessage({ '2_1': { deviceId: 7, value: 10 }, '2_2': { deviceId: 7, value: 20 } });
+        client.pruneDevicePublishes('7', ['2_2']);
+        mqttMocks.clientInstance.emit('connect');
+
+        expect(mqttMocks.publishMock.mock.calls.every(([topic]) => !topic.includes('2_1'))).toBe(true);
+        expect(mqttMocks.publishMock.mock.calls.some(([topic]) => topic.includes('2_2'))).toBe(true);
+        await client.close();
+    });
 });

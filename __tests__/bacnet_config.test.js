@@ -112,6 +112,23 @@ describe('BacnetConfig', () => {
         );
     });
 
+    test('a failed replacement preserves the original config and removes the temporary file', async () => {
+        const { BacnetConfig } = loadModule();
+        const config = new BacnetConfig();
+        const original = { device: { deviceId: 9, address: '10.0.0.9' }, objects: [] };
+        await config.save(original);
+        const rename = jest.spyOn(fs.promises, 'rename').mockRejectedValueOnce(new Error('rename failed'));
+        try {
+            await expect(config.save({
+                ...original, device: { deviceId: 9, address: '10.0.0.10' }
+            })).rejects.toThrow('rename failed');
+            expect(fs.readdirSync(tempDir)).toEqual(['device.9.json']);
+            expect(JSON.parse(fs.readFileSync(path.join(tempDir, 'device.9.json'), 'utf8'))).toEqual(original);
+        } finally {
+            rename.mockRestore();
+        }
+    });
+
     test('delete rejects when config file does not exist', async () => {
         const { BacnetConfig } = loadModule();
         const config = new BacnetConfig();

@@ -28,6 +28,7 @@ describe('Server helper methods', () => {
         jest.doMock('yaml', () => ({ parse: jest.fn(() => ({})) }));
         jest.doMock('express-rate-limit', () => {
             rateLimitMock = jest.fn(() => jest.fn());
+            rateLimitMock.MemoryStore = jest.fn(() => ({ shutdown: jest.fn() }));
             return rateLimitMock;
         });
         jest.doMock('../src/common', () => ({
@@ -417,7 +418,8 @@ describe('Server helper methods', () => {
             85,
             1,
             8,
-            4
+            4,
+            '114'
         );
         expect(res.statusCode).toBe(200);
     });
@@ -572,7 +574,8 @@ describe('Server helper methods', () => {
         const saveRes = createResponse();
         await server._scanDevice({
             body: { deviceId: 114, address: '192.168.1.10' },
-            query: { saveConfig: 'true' }
+            query: { saveConfig: 'true' },
+            user: { role: 'admin' }
         }, saveRes);
         expect(server.bacnetClient.saveConfig).toHaveBeenCalled();
         expect(saveRes.payload).toEqual([{ objectId: { type: 2, instance: 202 } }]);
@@ -613,5 +616,45 @@ describe('Server helper methods', () => {
 
         expect(res.statusCode).toBe(400);
         expect(res.payload.details).toBe('duplicate username');
+    });
+    test('overlapping scan callers share one window and abort releases the listener', async () => {
+        jest.useFakeTimers();
+        try {
+            const { EventEmitter } = require('node:events');
+            const server = Object.create(Server.prototype);
+            server.bacnetClient = new EventEmitter();
+            server.bacnetClient.scanForDevices = jest.fn();
+            const first = Object.assign(new EventEmitter(), createResponse());
+            const second = Object.assign(new EventEmitter(), createResponse());
+
+            server._scanForDevices({}, first);
+            server._scanForDevices({}, second);
+            expect(server.bacnetClient.scanForDevices).toHaveBeenCalledTimes(1);
+            expect(server.bacnetClient.listenerCount('deviceFound')).toBe(1);
+            first.emit('close');
+            second.emit('close');
+
+            expect(server.bacnetClient.listenerCount('deviceFound')).toBe(0);
+            expect(jest.getTimerCount()).toBe(0);
+            expect(first.payload).toBeNull();
+            expect(second.payload).toBeNull();
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    test('a viewer cannot persist configuration via the discovery route', async () => {
+        const server = Object.create(Server.prototype);
+        server.bacnetClient = { scanDevice: jest.fn(), saveConfig: jest.fn() };
+        const res = createResponse();
+
+        await server._scanDevice({
+            body: { deviceId: 114, address: '192.168.1.10' },
+            user: { role: 'viewer' }, query: { saveConfig: 'true' }
+        }, res);
+
+        expect(res.statusCode).toBe(403);
+        expect(server.bacnetClient.scanDevice).not.toHaveBeenCalled();
+        expect(server.bacnetClient.saveConfig).not.toHaveBeenCalled();
     });
 });

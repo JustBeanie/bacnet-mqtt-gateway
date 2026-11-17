@@ -356,6 +356,11 @@ This gateway solves one of the core IoT platform challenges: **protocol diversit
 
 **Full architecture guide:** [IoT Platform Architecture Leadership](https://www.novatechflow.com/p/iot-platform-architecture-leadership.html)
 
+**Blog posts about this gateway**
+
+- [How to Connect BACnet to the Cloud with an MQTT Gateway](https://www.novatechflow.com/2026/01/connect-bacnet-to-cloud-with-bacnet.html)
+- [BACnet to MQTT in Production](https://www.novatechflow.com/2026/03/bacnet-mqtt-in-production-real-cost-of.html)
+
 ### The Problem
 
 IoT platforms fail when they treat protocol integration as one-off work:
@@ -400,6 +405,8 @@ This gateway is a **reliability layer around a protocol bridge** — the edge la
 ```
 BACnet → bacnet-mqtt-gateway → MQTT Broker → Infinimesh / Kafka / Flink → Iceberg
 ```
+
+For the device layer behind the broker, see [infinimesh](https://infinimesh.org).
 
 ---
 

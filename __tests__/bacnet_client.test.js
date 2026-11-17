@@ -17,21 +17,23 @@ jest.mock('bacstack', () => {
         return emitter;
     });
     ctor.enum = {
-        ObjectTypes: { OBJECT_DEVICE: 8 },
-        PropertyIds: {
-            PROP_OBJECT_LIST: 76,
-            PROP_PRESENT_VALUE: 85,
-            PROP_OBJECT_NAME: 77,
-            PROP_OBJECT_IDENTIFIER: 75,
-            PROP_OBJECT_TYPE: 79,
-            PROP_DESCRIPTION: 28,
-            PROP_UNITS: 117
+        ObjectType: { DEVICE: 8 },
+        PropertyIdentifier: {
+            OBJECT_LIST: 76,
+            PRESENT_VALUE: 85,
+            OBJECT_NAME: 77,
+            OBJECT_IDENTIFIER: 75,
+            OBJECT_TYPE: 79,
+            DESCRIPTION: 28,
+            UNITS: 117
         },
         ApplicationTags: {
-            BACNET_APPLICATION_TAG_BOOLEAN: 1,
-            BACNET_APPLICATION_TAG_SIGNED_INT: 2,
-            BACNET_APPLICATION_TAG_REAL: 4,
-            BACNET_APPLICATION_TAG_CHARACTER_STRING: 7
+            NULL: 0,
+            BOOLEAN: 1,
+            SIGNED_INTEGER: 3,
+            REAL: 4,
+            CHARACTER_STRING: 7,
+            ERROR: 105
         }
     };
     return ctor;
@@ -73,6 +75,7 @@ describe('BacnetClient', () => {
     beforeEach(() => {
         jest.clearAllMocks();
         jest.useFakeTimers();
+        mockScheduleJob.mockImplementation(() => ({ cancel: jest.fn() }));
         process.env.NODE_ENV = 'development';
         process.env.NODE_CONFIG = JSON.stringify({
             bacnet: { maxSegments: 112, maxApdu: 5 },
@@ -122,7 +125,7 @@ describe('BacnetClient', () => {
         return {
             values: [{
                 values: [{
-                    value: objects.map((objectId) => ({ value: objectId }))
+                    id: 76, value: objects.map((objectId) => ({ value: objectId }))
                 }]
             }]
         };
@@ -157,6 +160,7 @@ describe('BacnetClient', () => {
 
     test('scanDevice rejects when readPropertyMultiple returns an error', async () => {
         mockReadPropertyMultiple.mockImplementation((_addr, _req, _opts, cb) => cb(new Error('mock failure')));
+        mockReadProperty.mockImplementation((_addr, _object, _property, _opts, cb) => cb(new Error('count unavailable')));
 
         const { BacnetClient } = require('../src/bacnet_client');
         const client = new BacnetClient({ runtimeState, bacnetConfig });
@@ -395,7 +399,7 @@ describe('BacnetClient', () => {
         cleanup(client);
     });
 
-    test('polling retries without PROP_UNITS when a device rejects that property', async () => {
+    test('polling retries without UNITS when a device rejects that property', async () => {
         mockReadPropertyMultiple
             .mockImplementationOnce((_addr, requestArray, _opts, cb) => {
                 expect(requestArray[0].properties.map((property) => property.id)).toEqual([85, 77, 117]);
@@ -417,16 +421,14 @@ describe('BacnetClient', () => {
         const client = new BacnetClient({ runtimeState, bacnetConfig });
         await client.ready;
 
-        const result = await client._readObjectPresentValue('10.0.0.3', 3, 1);
-        const cachedFallback = await client._readObjectPresentValue('10.0.0.3', 3, 1);
+        const cache = new Set();
+        const result = await client._readObjectPresentValue('10.0.0.3', 3, 1, cache);
+        const cachedFallback = await client._readObjectPresentValue('10.0.0.3', 3, 1, cache);
 
         expect(result.error).toBeNull();
         expect(cachedFallback.error).toBeNull();
         expect(mockReadPropertyMultiple).toHaveBeenCalledTimes(3);
-        expect(logger.log).toHaveBeenCalledWith(
-            'warn',
-            '[Polling] Units property is not supported for 3/1; retrying without units.'
-        );
+        expect(cache.has('3_1')).toBe(true);
         cleanup(client);
     });
 
@@ -529,7 +531,7 @@ describe('BacnetClient', () => {
         }));
         class AsyncBacnetConfig extends EventEmitter {
             async load() {
-                this.emit('configLoaded', {
+                await this.listeners('configLoaded')[0]({
                     device: { deviceId: 87, address: '10.0.0.87' },
                     polling: { class: 'normal', intervalMs: 5000 },
                     objects: [{ objectId: { type: 2, instance: 87 } }]
@@ -544,8 +546,7 @@ describe('BacnetClient', () => {
             readySettled = true;
         });
 
-        await Promise.resolve();
-        await Promise.resolve();
+        await jest.advanceTimersByTimeAsync(0);
         expect(runtimeState.upsertDeviceState).toHaveBeenCalled();
         expect(readySettled).toBe(false);
 
@@ -558,14 +559,11 @@ describe('BacnetClient', () => {
     });
 
     test('registerDeviceConfig ignores invalid configs and saveConfig persists valid ones', async () => {
-        const { logger } = require('../src/common');
         const { BacnetClient } = require('../src/bacnet_client');
         const client = new BacnetClient({ runtimeState, bacnetConfig });
-        jest.spyOn(client, '_registerDeviceConfig');
         await client.ready;
 
-        await client._registerDeviceConfig({});
-        expect(logger.log).toHaveBeenCalledWith('warn', '[BacnetClient] Loaded a device config without a valid deviceId.');
+        await expect(client._registerDeviceConfig({})).rejects.toThrow('device.deviceId');
 
         const saveSpy = jest.spyOn(bacnetConfig, 'save');
         await client.saveConfig({
@@ -595,8 +593,7 @@ describe('BacnetClient', () => {
             [{ objectId: { type: 2, instance: 1 } }],
             { schedule: '*/5 * * * * *', class: 'normal' }
         );
-        const runtime = client.deviceRuntime.get('90');
-        expect(runtime.cronDue).toBe(true);
+        expect(client.deviceRuntime.get('90').cronDue).toBe(true);
 
         await client.startPolling(
             { deviceId: 90, address: '10.0.0.90' },
@@ -605,6 +602,7 @@ describe('BacnetClient', () => {
         );
 
         expect(cancel).toHaveBeenCalled();
+        const runtime = client.deviceRuntime.get('90');
         expect(runtime.schedule).toBeNull();
         expect(runtime.pollClass).toBe('fast');
         expect(runtime.polling).toEqual(expect.objectContaining({
@@ -700,7 +698,7 @@ describe('BacnetClient', () => {
             }
         );
 
-        expect(results[0].result.error.message).toBe('worker failed');
+        expect(results[0].error.message).toBe('worker failed');
         expect(client._findValueById([], 85)).toBeNull();
         expect(client._mapToDeviceObject(null)).toBeNull();
         cleanup(client);
@@ -743,18 +741,14 @@ describe('BacnetClient', () => {
     });
 
     test('scanDevice rejects when object reads fail catastrophically', async () => {
-        const { logger } = require('../src/common');
         const { BacnetClient } = require('../src/bacnet_client');
         const client = new BacnetClient({ runtimeState, bacnetConfig });
         await client.ready;
-        jest.spyOn(client, '_readObjectList').mockImplementation((_addr, _id, cb) => cb(null, {
-            values: [{ values: [{ value: [{ value: { type: 2, instance: 1 } }] }] }]
-        }));
+        jest.spyOn(client, '_readObjectList').mockResolvedValue(buildObjectListResponse([{ type: 2, instance: 1 }]));
         jest.spyOn(client, '_readObjectListCount').mockResolvedValue(1);
         jest.spyOn(client, '_readObjectDiscoveryDetails').mockRejectedValue(new Error('catastrophic read'));
 
         await expect(client.scanDevice({ address: '10.0.0.5', deviceId: 5 })).rejects.toThrow('catastrophic read');
-        expect(logger.log).toHaveBeenCalledWith('error', expect.stringContaining('catastrophic read'));
         cleanup(client);
     });
 
@@ -766,9 +760,9 @@ describe('BacnetClient', () => {
         const client = new BacnetClient({ runtimeState, bacnetConfig });
         await client.ready;
 
-        await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, 7)).resolves.toEqual([{ type: 2, value: 7 }]);
+        await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, 7)).resolves.toEqual([{ type: 3, value: 7 }]);
         await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, 7.5)).resolves.toEqual([{ type: 4, value: 7.5 }]);
-        await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, '42')).resolves.toEqual([{ type: 2, value: 42 }]);
+        await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, '42')).resolves.toEqual([{ type: 3, value: 42 }]);
         await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, '42.5')).resolves.toEqual([{ type: 4, value: 42.5 }]);
         await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, 'abc')).resolves.toEqual([{ type: 7, value: 'abc' }]);
         await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, true, undefined, 1)).resolves.toEqual([{ type: 1, value: 1 }]);
@@ -777,14 +771,12 @@ describe('BacnetClient', () => {
     });
 
     test('writeProperty rejects BACnet errors and runtime/list status helpers delegate correctly', async () => {
-        const { logger } = require('../src/common');
         mockWriteProperty.mockImplementationOnce((_a, _b, _c, _d, _e, cb) => cb(new Error('write error')));
         const { BacnetClient } = require('../src/bacnet_client');
         const client = new BacnetClient({ runtimeState, bacnetConfig });
         await client.ready;
 
         await expect(client.writeProperty('a', { type: 1, instance: 1 }, 85, 1)).rejects.toThrow('write error');
-        expect(logger.log).toHaveBeenCalledWith('error', expect.stringContaining('[BACnet Write] Error writing property: Error: write error'));
         await expect(client.listRuntimeStates()).resolves.toEqual([]);
         await expect(client.listRuntimeObjectStates(114)).resolves.toEqual([]);
         expect(runtimeState.listObjectStates).toHaveBeenCalledWith('114');
@@ -805,7 +797,7 @@ describe('BacnetClient', () => {
         jest.advanceTimersByTime(client.schedulerTickMs);
         await Promise.resolve();
 
-        expect(logger.log).toHaveBeenCalledWith('error', '[Polling] Scheduler loop failed: loop failed');
+        expect(logger.log).toHaveBeenCalledWith('error', '[Polling] Scheduler failed: loop failed');
         cleanup(client);
     });
 
@@ -823,46 +815,21 @@ describe('BacnetClient', () => {
         cleanup(client);
     });
 
-    test('drainQueue logs poll and nested drain failures', async () => {
+    test('drainQueue runs the next poll after a poll rejects', async () => {
         const { logger } = require('../src/common');
         const { BacnetClient } = require('../src/bacnet_client');
         const client = new BacnetClient({ runtimeState, bacnetConfig });
         await client.ready;
 
         client.queue.push('first', 'second');
-        client.queuedDevices.add('first');
-        client.queuedDevices.add('second');
-
-        let pollCalls = 0;
-        jest.spyOn(client, '_pollDevice').mockImplementation(async () => {
-            pollCalls += 1;
-            if (pollCalls === 1) {
-                throw new Error('poll blew up');
-            }
-        });
-
-        const drainSpy = jest.spyOn(client, '_drainQueue');
-        const realDrain = drainSpy.getMockImplementation();
-        drainSpy.mockImplementation(async function wrappedDrain() {
-            if (pollCalls >= 1) {
-                throw new Error('drain blew up');
-            }
-            return realDrain ? realDrain.apply(this, arguments) : undefined;
-        });
-
-        const immediateSpy = jest.spyOn(global, 'setImmediate').mockImplementation((fn) => {
-            fn();
-            return 0;
-        });
-
+        const poll = jest.spyOn(client, '_pollDevice').mockRejectedValueOnce(new Error('poll failed')).mockResolvedValueOnce();
         await client._drainQueue();
-        await Promise.resolve();
+        await jest.advanceTimersByTimeAsync(0);
 
-        expect(logger.log).toHaveBeenCalledWith('error', '[Polling] Device poll failed for first: poll blew up');
-        expect(logger.log).toHaveBeenCalledWith('error', '[Polling] Queue drain failed: drain blew up');
-
-        immediateSpy.mockRestore();
-        cleanup(client);
+        expect(poll.mock.calls).toEqual([['first'], ['second']]);
+        expect(logger.log).toHaveBeenCalledWith('error', '[Polling] Device poll failed for first: poll failed');
+        expect(client.activePolls).toBe(0);
+        await client.close();
     });
 
     test('pollDevice returns early when runtime is missing', async () => {
@@ -873,5 +840,105 @@ describe('BacnetClient', () => {
         await expect(client._pollDevice('missing')).resolves.toBeUndefined();
 
         cleanup(client);
+    });
+    test('shutdown cancels active requests and detaches timers and listeners', async () => {
+        const { BacnetClient } = require('../src/bacnet_client');
+        runtimeState.close = jest.fn().mockResolvedValue();
+        const client = new BacnetClient({ runtimeState, bacnetConfig });
+        await client.ready;
+        mockReadPropertyMultiple.mockImplementation(() => {});
+        const scan = client.scanDevice({ address: '10.0.0.1', deviceId: 1 });
+        const cancelled = expect(scan).rejects.toThrow('closing');
+
+        const closed = client.close();
+        expect(client.close()).toBe(closed);
+        await cancelled;
+        await closed;
+
+        expect(client.requests.active.size).toBe(0);
+        expect(client.client.listenerCount('iAm')).toBe(0);
+        expect(bacnetConfig.listenerCount('configLoaded')).toBe(0);
+        expect(client.schedulerHandle).toBeNull();
+        expect(runtimeState.close).toHaveBeenCalledTimes(1);
+    });
+
+    test('device updates serialize and an old poll cannot publish after replacement', async () => {
+        const { BacnetClient } = require('../src/bacnet_client');
+        runtimeState.pruneDeviceObjects = jest.fn().mockResolvedValue();
+        const client = new BacnetClient({ runtimeState, bacnetConfig });
+        await client.ready;
+        const makeConfig = (point) => ({
+            device: { address: '10.0.0.1', deviceId: 1 },
+            polling: { class: 'normal' },
+            objects: [{ objectId: { type: 2, instance: point } }]
+        });
+        await client.saveConfig(makeConfig(1));
+        let finishPoll;
+        mockReadPropertyMultiple.mockImplementationOnce((_address, _request, _options, callback) => { finishPoll = callback; });
+        const publish = jest.fn();
+        client.on('values', publish);
+        const poll = client._pollDevice('1');
+
+        let finishFirstSave;
+        const save = jest.spyOn(bacnetConfig, 'save')
+            .mockImplementationOnce(() => new Promise((resolve) => { finishFirstSave = resolve; }))
+            .mockResolvedValueOnce();
+        const first = client.saveConfig(makeConfig(2));
+        const second = client.saveConfig(makeConfig(3));
+        await jest.advanceTimersByTimeAsync(0);
+        expect(save).toHaveBeenCalledTimes(1);
+
+        finishFirstSave();
+        await Promise.all([first, second]);
+        finishPoll(null, buildValueResponse(2, 1, 99));
+        await poll;
+
+        expect(save.mock.calls).toEqual([[makeConfig(2)], [makeConfig(3)]]);
+        expect(client.deviceConfigs.get('1')).toEqual(makeConfig(3));
+        expect(runtimeState.pruneDeviceObjects).toHaveBeenLastCalledWith('1', ['2_3']);
+        expect(runtimeState.saveObjectTelemetry).not.toHaveBeenCalled();
+        expect(publish).not.toHaveBeenCalled();
+        await client.close();
+    });
+
+    test('falls back to indexed discovery after the bulk read fails', async () => {
+        const { BacnetClient } = require('../src/bacnet_client');
+        const client = new BacnetClient({ runtimeState, bacnetConfig });
+        await client.ready;
+        const objectId = { type: 2, instance: 1 };
+        mockReadPropertyMultiple.mockImplementation((_address, [{ properties }], _options, done) => {
+            if (properties[0].id === 76) done(new Error('bulk unavailable'));
+            else done(null, buildFullObjectResponse(objectId, 'Temperature'));
+        });
+        mockReadProperty.mockImplementation((_address, _objectId, _property, { arrayIndex }, done) => {
+            done(null, buildReadPropertyResponse(arrayIndex === 0 ? 1 : objectId, arrayIndex));
+        });
+
+        await expect(client.scanDevice({ address: '10.0.0.1', deviceId: 1 }))
+            .resolves.toEqual([expect.objectContaining({ objectId, name: 'Temperature' })]);
+        expect(mockReadProperty.mock.calls.map((args) => args[3].arrayIndex)).toEqual([0, 1]);
+        await client.close();
+    });
+
+    test('rejects a queued write if the device moves to a different address', async () => {
+        const { BacnetClient } = require('../src/bacnet_client');
+        const client = new BacnetClient({ runtimeState, bacnetConfig });
+        await client.ready;
+        const objectId = { type: 1, instance: 2 };
+        const save = (address) => client.saveConfig({ device: { deviceId: 1, address }, objects: [{ objectId }] });
+        await save('10.0.0.1');
+        let acknowledge;
+        mockWriteProperty.mockImplementationOnce((_address, _object, _property, _values, _options, done) => {
+            acknowledge = done;
+        });
+        const write = (value) => client.writeProperty('10.0.0.1', objectId, 85, value, undefined, undefined, 1);
+        const first = write(1);
+        const retired = expect(write(2)).rejects.toThrow('address changed');
+
+        await save('10.0.0.2');
+        acknowledge();
+        await Promise.all([first, retired]);
+        expect(mockWriteProperty).toHaveBeenCalledTimes(1);
+        await client.close();
     });
 });

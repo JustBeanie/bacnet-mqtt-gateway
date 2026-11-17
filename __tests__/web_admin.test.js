@@ -19,6 +19,7 @@ describe('web admin app', () => {
                     this.store.delete(key);
                 }
             },
+            AbortController,
             TextEncoder,
             TextDecoder,
             Uint8Array,
@@ -50,7 +51,7 @@ describe('web admin app', () => {
             clearInterval: jest.fn(),
             axios: {
                 defaults: { headers: { common: {} } },
-                interceptors: { response: { use: jest.fn() } },
+                interceptors: { response: { use: jest.fn(), eject: jest.fn() } },
                 create: jest.fn(() => ({ post: jest.fn() })),
                 post: jest.fn(),
                 get: jest.fn(),
@@ -144,7 +145,7 @@ describe('web admin app', () => {
 
         await component.load();
 
-        expect(context.axios.get).toHaveBeenCalledWith('/api/bacnet/runtime-objects/Gree%20VRF%2F1');
+        expect(context.axios.get).toHaveBeenCalledWith('/api/bacnet/runtime-objects/Gree%20VRF%2F1', expect.objectContaining({ signal: expect.any(Object) }));
         expect(component.objects).toEqual([{ device_id: 'Gree VRF/1', object_key: '2_202', value: 21.5 }]);
         expect(component.loaded).toBe(true);
         expect(component.loading).toBe(false);
@@ -192,7 +193,7 @@ describe('web admin app', () => {
         expect(context.axios.put).toHaveBeenCalledWith('/api/bacnet/1/objects', {
             deviceId: '1',
             address: '192.168.1.20'
-        });
+        }, expect.objectContaining({ signal: expect.any(Object) }));
         expect(component.objects[0]).toEqual(expect.objectContaining({
             objectKey: '2_202',
             configured: true,
@@ -278,9 +279,74 @@ describe('web admin app', () => {
                     name: 'Zone Temp',
                     units: 62
                 })]
-            })
+            }),
+            expect.objectContaining({ signal: expect.any(Object) })
         );
         expect(component.saveSuccess).toBe('Saved 1 object for polling.');
         expect(component.configuredObjectKeys.has('2_202')).toBe(true);
+    });
+    test('late scan and diagnostics responses cannot overwrite a newer device', async () => {
+        const { context, exports } = loadAdminScript();
+        const scan = exports.appOptions.components.DeviceScan;
+        const component = { ...scan.data(), ...scan.methods, deviceId: '1', address: '192.168.1.10' };
+
+        let finishFirstDiagnostics;
+        context.axios.put.mockResolvedValueOnce({ data: [{ objectId: { type: 2, instance: 1 } }] });
+        context.axios.get.mockResolvedValueOnce({ data: [] }).mockImplementationOnce(
+            () => new Promise((resolve) => { finishFirstDiagnostics = resolve; })
+        );
+        const first = component.scanDevice();
+        for (let attempt = 0; attempt < 10 && !finishFirstDiagnostics; attempt++) await Promise.resolve();
+        expect(finishFirstDiagnostics).toBeDefined();
+        const oldSignal = component.diagnosticsRequest.signal;
+
+        component.deviceId = '2';
+        component.address = '192.168.1.11';
+        context.axios.put.mockResolvedValueOnce({ data: [{ objectId: { type: 2, instance: 2 } }] });
+        context.axios.get.mockResolvedValue({ data: [] });
+        await component.scanDevice();
+        finishFirstDiagnostics({ data: [{ object_key: '2_1' }] });
+        await first;
+
+        expect(oldSignal.aborted).toBe(true);
+        expect(component.objects.map(({ objectKey }) => objectKey)).toEqual(['2_2']);
+        expect(component.runtimeObjectKeys.size).toBe(0);
+        expect(component.loading).toBe(false);
+    });
+
+    test('logout cancels refresh before a late token pair can be persisted', async () => {
+        const { context, exports } = loadAdminScript();
+        const app = exports.appOptions;
+        const component = { ...app.data(), ...app.methods };
+        let finishRefresh;
+        const post = jest.fn(() => new Promise((resolve) => { finishRefresh = resolve; }));
+        context.axios.create.mockReturnValue({ post });
+        const refresh = component.refreshSession('valid-refresh');
+        const failed = expect(refresh).rejects.toMatchObject({ name: 'AbortError' });
+        for (let attempt = 0; attempt < 10 && !finishRefresh; attempt++) await Promise.resolve();
+
+        component.logout();
+        const payload = Buffer.from(JSON.stringify({ username: 'admin', role: 'admin' })).toString('base64url');
+        finishRefresh({ data: { token: `header.${payload}.sig`, refreshToken: 'replacement' } });
+        await failed;
+
+        expect(component.tokenValid).toBe(false);
+        expect(context.localStorage.store.size).toBe(0);
+        expect(context.axios.defaults.headers.common.Authorization).toBeUndefined();
+    });
+
+    test('unmount clears the health timer and ejects the Axios interceptor', async () => {
+        const { context, exports } = loadAdminScript();
+        const app = exports.appOptions;
+        const component = { ...app.data(), ...app.methods };
+        context.window.setInterval.mockReturnValue(12);
+        context.axios.interceptors.response.use.mockReturnValue(3);
+        context.axios.get.mockResolvedValue({ data: {} });
+        await app.mounted.call(component);
+
+        app.beforeUnmount.call(component);
+
+        expect(context.clearInterval).toHaveBeenCalledWith(12);
+        expect(context.axios.interceptors.response.eject).toHaveBeenCalledWith(3);
     });
 });

@@ -2,7 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
 const config = require('config');
-const { DeviceObjectId, DeviceObject, logger } = require('./common');
+const { randomUUID } = require('node:crypto');
+const { logger } = require('./common');
 
 const devicesFolder = config.get('bacnet.configFolder');
 
@@ -44,11 +45,12 @@ class BacnetConfig extends EventEmitter {
         }
 
         logger.log('info', `Device configs found: ${files}`);
-        const loadedConfigs = await Promise.all(files.map(async (file) => {
+        const loadedConfigs = [];
+        for (const file of files.sort()) {
             // Files prefixed with _ are deactivated and therefore skipped.
-            if (file.startsWith('_')) {
+            if (file.startsWith('_') || file.endsWith('.tmp')) {
                 logger.log('info', `Skipping deactivated file ${file}`);
-                return null;
+                continue;
             }
 
             let contents;
@@ -56,7 +58,7 @@ class BacnetConfig extends EventEmitter {
                 contents = await fs.promises.readFile(path.join(devicesFolder, file), 'utf8');
             } catch (err) {
                 logger.log('error', `Error while reading config file '${file}': ${err}`);
-                return null;
+                continue;
             }
 
             let deviceConfig;
@@ -64,41 +66,40 @@ class BacnetConfig extends EventEmitter {
                 deviceConfig = JSON.parse(contents);
             } catch (parseErr) {
                 logger.log('error', `Error while parsing config file '${file}': ${parseErr}`);
-                return null;
+                continue;
             }
 
             try {
                 await this._emitAsync('configLoaded', deviceConfig);
-                return deviceConfig;
+                loadedConfigs.push(deviceConfig);
             } catch (listenerErr) {
                 logger.log('error', `Error while registering config file '${file}': ${listenerErr}`);
-                return null;
+                continue;
             }
-        }));
-
-        return loadedConfigs.filter((deviceConfig) => deviceConfig !== null);
-    }
-
-    save(deviceConfig) {
-        let configPath;
-        try {
-            configPath = this._buildConfigPath(deviceConfig.device.deviceId);
-        } catch (err) {
-            logger.log('error', `Error while resolving config file path: ${err}`);
-            return Promise.reject(err);
         }
 
-        return new Promise((resolve, reject) => {
-            fs.writeFile(configPath.targetPath, JSON.stringify(deviceConfig, null, 4), (err) => {
-                if (err) {
-                    logger.log('error', `Error while writing config file: ${err}`);
-                    reject(err);
-                    return;
-                }
-                logger.log('info', `Config file '${configPath.filename}' successfully saved.`);
-                resolve();
+        return loadedConfigs;
+    }
+
+    async save(deviceConfig) {
+        const { filename, targetPath } = this._buildConfigPath(deviceConfig.device.deviceId);
+        const tempPath = `${targetPath}.${randomUUID()}.tmp`;
+        try {
+            const file = await fs.promises.open(tempPath, 'wx');
+            try {
+                await file.writeFile(JSON.stringify(deviceConfig, null, 4));
+                await file.sync();
+            } finally {
+                await file.close();
+            }
+            await fs.promises.rename(tempPath, targetPath);
+            logger.log('info', `Config file '${filename}' successfully saved.`);
+        } catch (error) {
+            await fs.promises.rm(tempPath, { force: true }).catch((cleanupError) => {
+                logger.log('warn', `Failed to remove temporary device config: ${cleanupError.message}`);
             });
-        });
+            throw error;
+        }
     }
 
     delete(deviceId) {

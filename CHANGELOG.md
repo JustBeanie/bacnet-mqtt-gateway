@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.0.3
+
+- Make configuration saves atomic and discard poll results from superseded
+  configurations.
+- Bound BACnet requests and MQTT publishes, and fix segmented replies, indexed
+  discovery, and writes without an explicit priority.
+- Drain active work during shutdown and retain up to seven days and 100,000 rows
+  of poll history.
+- Fix races in credential refresh, password changes, and console requests.
+- Update `ip-address` to 10.7.5 and run Supervisor and MQTT smoke tests in CI.
+
 ## 2.0.2
 
 - Replace the app manifest's obsolete `watchdog:` key with a Docker

@@ -1,0 +1,419 @@
+diff --git a/node_modules/bacstack/lib/client.js b/node_modules/bacstack/lib/client.js
+index 58e6607..450d54c 100644
+--- a/node_modules/bacstack/lib/client.js
++++ b/node_modules/bacstack/lib/client.js
+@@ -2,6 +2,8 @@
+ 
+ // Util Modules
+ const EventEmitter = require('events').EventEmitter;
++const {lookup} = require('dns');
++const {isIPv4} = require('net');
+ const debug = require('debug')('bacstack');
+ 
+ // Local Modules
+@@ -41,10 +43,9 @@ class Client extends EventEmitter {
+     options = options || {};
+ 
+     this._invokeCounter = 1;
+-    this._invokeStore = {};
+-
+-    this._lastSequenceNumber = 0;
+-    this._segmentStore = [];
++    this._invokeStore = new Map();
++    this._segmentStore = new Map();
++    this._closed = false;
+ 
+     this._settings = {
+       port: options.port || 47808,
+@@ -61,34 +62,67 @@ class Client extends EventEmitter {
+     });
+ 
+     // Setup code
+-    this._transport.on('message', this._receiveData.bind(this));
+-    this._transport.on('error', this._receiveError.bind(this));
++    this._onTransportMessage = this._receiveData.bind(this);
++    this._onTransportError = this._receiveError.bind(this);
++    this._transport.on('message', this._onTransportMessage);
++    this._transport.on('error', this._onTransportError);
+     this._transport.open();
+   }
+ 
+   // Helper utils
+   _getInvokeId() {
+-    const id = this._invokeCounter++;
+-    if (id >= 256) this._invokeCounter = 1;
+-    return id - 1;
++    for (let attempt = 0; attempt < 255; attempt++) {
++      const id = this._invokeCounter;
++      this._invokeCounter = id === 255 ? 1 : id + 1;
++      if (!this._invokeStore.has(id)) return id;
++    }
++    throw new Error('No BACnet invoke IDs are available');
++  }
++
++  _matchesRequest(id, address, service) {
++    const request = this._invokeStore.get(id);
++    return request && (request.address === undefined || request.address === address) &&
++      (service === undefined || request.service === undefined || request.service === service);
++  }
++
++  _invokeCallback(id, err, result, address, service) {
++    if (this._matchesRequest(id, address, service)) this._finishRequest(id, err, result);
++  }
++
++  _finishRequest(id, err, data) {
++    const request = this._invokeStore.get(id);
++    if (!request) return;
++    this._invokeStore.delete(id);
++    clearTimeout(request.timeout);
++    this._removeSegments(this._segmentKey(request.address, request.service, id, false));
++    request.callback(err, data);
+   }
+ 
+-  _invokeCallback(id, err, result) {
+-    const callback = this._invokeStore[id];
+-    if (callback) return callback(err, result);
+-    debug('InvokeId ', id, ' not found -> drop package');
++  _addCallback(id, callback, address, service) {
++    if (this._closed) throw new Error('BACnet client is closed');
++    if (this._invokeStore.has(id)) throw new Error('BACnet invoke ID is in use');
++    const timeout = setTimeout(() => this._finishRequest(id, new Error('ERR_TIMEOUT')), this._settings.apduTimeout);
++    this._invokeStore.set(id, { callback, address, service, timeout });
+   }
+ 
+-  _addCallback(id, callback) {
+-    const timeout = setTimeout(() => {
+-      delete this._invokeStore[id];
+-      callback(new Error('ERR_TIMEOUT'));
+-    }, this._settings.apduTimeout);
+-    this._invokeStore[id] = (err, data) => {
+-      clearTimeout(timeout);
+-      delete this._invokeStore[id];
+-      callback(err, data);
++  _sendRequest(buffer, address, invokeId, service, callback) {
++    this._addCallback(invokeId, callback, address, service);
++    const request = this._invokeStore.get(invokeId);
++    const send = (error, peer) => {
++      if (this._invokeStore.get(invokeId) !== request) return;
++      if (error) {
++        this._finishRequest(invokeId, error);
++        return;
++      }
++      request.address = peer;
++      try {
++        this._transport.send(buffer.buffer, buffer.offset, peer);
++      } catch (sendError) {
++        this._finishRequest(invokeId, sendError);
++      }
+     };
++    if (isIPv4(address)) send(null, address);
++    else lookup(address, {family: 4}, send);
+   }
+ 
+   _getBuffer() {
+@@ -99,14 +133,14 @@ class Client extends EventEmitter {
+   }
+ 
+   // Service Handlers
+-  _processError(invokeId, buffer, offset, length) {
++  _processError(address, service, invokeId, buffer, offset, length) {
+     const result = baServices.error.decode(buffer, offset, length);
+     if (!result) return debug('Couldn`t decode Error');
+-    this._invokeCallback(invokeId, new Error('BacnetError - Class:' + result.class + ' - Code:' + result.code));
++    this._invokeCallback(invokeId, new Error('BacnetError - Class:' + result.class + ' - Code:' + result.code), null, address, service);
+   }
+ 
+-  _processAbort(invokeId, reason) {
+-    this._invokeCallback(invokeId, new Error('BacnetAbort - Reason:' + reason));
++  _processAbort(address, invokeId, reason) {
++    this._invokeCallback(invokeId, new Error('BacnetAbort - Reason:' + reason), null, address);
+   }
+ 
+   _segmentAckResponse(receiver, negative, server, originalInvokeId, sequencenumber, actualWindowSize) {
+@@ -117,52 +151,54 @@ class Client extends EventEmitter {
+     this._transport.send(buffer.buffer, buffer.offset, receiver);
+   }
+ 
+-  _performDefaultSegmentHandling(sender, adr, type, service, invokeId, maxSegments, maxApdu, sequencenumber, first, moreFollows, buffer, offset, length) {
+-    if (first) {
+-      this._segmentStore = [];
+-      type &= ~baEnum.PduConReqBits.SEGMENTED_MESSAGE;
+-      let apduHeaderLen = 3;
+-      if ((type & baEnum.PDU_TYPE_MASK) === baEnum.PduTypes.CONFIRMED_REQUEST) {
+-        apduHeaderLen = 4;
+-      }
+-      const apdubuffer = this._getBuffer();
+-      apdubuffer.offset = 0;
+-      buffer.copy(apdubuffer.buffer, apduHeaderLen, offset, offset + length);
+-      if ((type & baEnum.PDU_TYPE_MASK) === baEnum.PduTypes.CONFIRMED_REQUEST) {
+-        baApdu.encodeConfirmedServiceRequest(apdubuffer, type, service, maxSegments, maxApdu, invokeId, 0, 0);
+-      } else {
+-        baApdu.encodeComplexAck(apdubuffer, type, service, invokeId, 0, 0);
+-      }
+-      this._segmentStore.push(apdubuffer.buffer.slice(0, length + apduHeaderLen));
+-    } else {
+-      this._segmentStore.push(buffer.slice(offset, offset + length));
++  _segmentKey(address, service, invokeId, server) {
++    return JSON.stringify([address, service, invokeId, server]);
++  }
++
++  _removeSegments(key) {
++    const transaction = this._segmentStore.get(key);
++    if (!transaction) return;
++    clearTimeout(transaction.timeout);
++    this._segmentStore.delete(key);
++  }
++
++  _processSegment(address, type, service, invokeId, maxSegments, maxApdu, server, sequence, windowSize, buffer, offset, length) {
++    if (!server && !this._matchesRequest(invokeId, address, service)) return;
++    if (!windowSize || length < 0) return;
++    const key = this._segmentKey(address, service, invokeId, server);
++    let transaction = this._segmentStore.get(key);
++    const unsegmentedType = type & ~(baEnum.PduConReqBits.SEGMENTED_MESSAGE | baEnum.PduConReqBits.MORE_FOLLOWS);
++    if (!transaction) {
++      if (sequence !== 0 || this._segmentStore.size >= 128) return;
++      const header = { buffer: Buffer.alloc(4), offset: 0 };
++      if (server) baApdu.encodeConfirmedServiceRequest(header, unsegmentedType, service, maxSegments, maxApdu, invokeId, 0, 0);
++      else baApdu.encodeComplexAck(header, unsegmentedType, service, invokeId, 0, 0);
++      const timeout = setTimeout(() => this._removeSegments(key), this._settings.apduTimeout);
++      transaction = { chunks: [header.buffer.subarray(0, header.offset)], nextSequence: 0, timeout };
++      this._segmentStore.set(key, transaction);
+     }
+-    if (!moreFollows) {
+-      const apduBuffer = Buffer.concat(this._segmentStore);
+-      this._segmentStore = [];
+-      type &= ~baEnum.PduConReqBits.SEGMENTED_MESSAGE;
+-      this._handlePdu(adr, type, apduBuffer, 0, apduBuffer.length);
++
++    if (sequence !== transaction.nextSequence) {
++      this._segmentAckResponse(address, true, server, invokeId, (transaction.nextSequence + 255) % 256, windowSize);
++      return;
+     }
+-  }
+ 
+-  _processSegment(receiver, type, service, invokeId, maxSegments, maxApdu, server, sequencenumber, proposedWindowNumber, buffer, offset, length) {
+-    let first = false;
+-    if (sequencenumber === 0 && this._lastSequenceNumber === 0) {
+-      first = true;
+-    } else {
+-      if (sequencenumber !== this._lastSequenceNumber + 1) {
+-        return this._segmentAckResponse(receiver, true, server, invokeId, this._lastSequenceNumber, proposedWindowNumber);
+-      }
++    if (transaction.chunks.length > 256) {
++      this._removeSegments(key);
++      if (!server) this._finishRequest(invokeId, new Error('BACnet segmented response exceeded 256 segments'));
++      return;
+     }
+-    this._lastSequenceNumber = sequencenumber;
++    transaction.nextSequence = (sequence + 1) % 256;
++    transaction.chunks.push(buffer.subarray(offset, offset + length));
+     const moreFollows = type & baEnum.PduConReqBits.MORE_FOLLOWS;
+-    if (!moreFollows) {
+-      this._lastSequenceNumber = 0;
++    if (sequence % windowSize === 0 || !moreFollows) {
++      this._segmentAckResponse(address, false, server, invokeId, sequence, windowSize);
+     }
+-    if ((sequencenumber % proposedWindowNumber) === 0 || !moreFollows) {
+-      this._segmentAckResponse(receiver, false, server, invokeId, sequencenumber, proposedWindowNumber);
++    if (!moreFollows) {
++      this._removeSegments(key);
++      const assembled = Buffer.concat(transaction.chunks);
++      this._handlePdu(address, unsegmentedType, assembled, 0, assembled.length);
+     }
+-    this._performDefaultSegmentHandling(this, receiver, type, service, invokeId, maxSegments, maxApdu, sequencenumber, first, moreFollows, buffer, offset, length);
+   }
+ 
+   _processConfirmedServiceRequest(address, type, service, maxSegments, maxApdu, invokeId, buffer, offset, length) {
+@@ -381,14 +417,12 @@ class Client extends EventEmitter {
+         break;
+       case baEnum.PduTypes.SIMPLE_ACK:
+         result = baApdu.decodeSimpleAck(buffer, offset);
+-        offset += result.len;
+-        length -= result.len;
+-        this._invokeCallback(result.invokeId, null, {result: result, buffer: buffer, offset: offset + result.len, length: length - result.len});
++        this._invokeCallback(result.invokeId, null, {result, buffer, offset: offset + result.len, length: length - result.len}, address, result.service);
+         break;
+       case baEnum.PduTypes.COMPLEX_ACK:
+         result = baApdu.decodeComplexAck(buffer, offset);
+         if ((type & baEnum.PduConReqBits.SEGMENTED_MESSAGE) === 0) {
+-          this._invokeCallback(result.invokeId, null, {result: result, buffer: buffer, offset: offset + result.len, length: length - result.len});
++          this._invokeCallback(result.invokeId, null, {result, buffer, offset: offset + result.len, length: length - result.len}, address, result.service);
+         } else {
+           this._processSegment(address, result.type, result.service, result.invokeId, baEnum.MaxSegmentsAccepted.SEGMENTS_0, baEnum.MaxApduLengthAccepted.OCTETS_50, false, result.sequencenumber, result.proposedWindowNumber, buffer, offset + result.len, length - result.len);
+         }
+@@ -400,12 +434,12 @@ class Client extends EventEmitter {
+         break;
+       case baEnum.PduTypes.ERROR:
+         result = baApdu.decodeError(buffer, offset);
+-        this._processError(result.invokeId, buffer, offset + result.len, length - result.len);
++        this._processError(address, result.service, result.invokeId, buffer, offset + result.len, length - result.len);
+         break;
+       case baEnum.PduTypes.REJECT:
+       case baEnum.PduTypes.ABORT:
+         result = baApdu.decodeAbort(buffer, offset);
+-        this._processAbort(result.invokeId, result.reason);
++        this._processAbort(address, result.invokeId, result.reason);
+         break;
+       case baEnum.PduTypes.CONFIRMED_REQUEST:
+         result = baApdu.decodeConfirmedServiceRequest(buffer, offset);
+@@ -564,10 +598,10 @@ class Client extends EventEmitter {
+   readProperty(address, objectId, propertyId, options, next) {
+     next = next || options;
+     const settings = {
+-      maxSegments: options.maxSegments || baEnum.MaxSegmentsAccepted.SEGMENTS_65,
+-      maxApdu: options.maxApdu || baEnum.MaxApduLengthAccepted.OCTETS_1476,
+-      invokeId: options.invokeId || this._getInvokeId(),
+-      arrayIndex: options.arrayIndex || baEnum.ASN1_ARRAY_ALL
++      maxSegments: options.maxSegments ?? baEnum.MaxSegmentsAccepted.SEGMENTS_65,
++      maxApdu: options.maxApdu ?? baEnum.MaxApduLengthAccepted.OCTETS_1476,
++      invokeId: options.invokeId ?? this._getInvokeId(),
++      arrayIndex: options.arrayIndex ?? baEnum.ASN1_ARRAY_ALL
+     };
+     const buffer = this._getBuffer();
+     baNpdu.encode(buffer, baEnum.NpduControlPriority.NORMAL_MESSAGE | baEnum.NpduControlBits.EXPECTING_REPLY, address, null, DEFAULT_HOP_COUNT, baEnum.NetworkLayerMessageType.WHO_IS_ROUTER_TO_NETWORK, 0);
+@@ -575,8 +609,7 @@ class Client extends EventEmitter {
+     baApdu.encodeConfirmedServiceRequest(buffer, type, baEnum.ConfirmedServiceChoice.READ_PROPERTY, settings.maxSegments, settings.maxApdu, settings.invokeId, 0, 0);
+     baServices.readProperty.encode(buffer, objectId.type, objectId.instance, propertyId, settings.arrayIndex);
+     baBvlc.encode(buffer.buffer, baEnum.BvlcResultPurpose.ORIGINAL_UNICAST_NPDU, buffer.offset);
+-    this._transport.send(buffer.buffer, buffer.offset, address);
+-    this._addCallback(settings.invokeId, (err, data) => {
++    this._sendRequest(buffer, address, settings.invokeId, baEnum.ConfirmedServiceChoice.READ_PROPERTY, (err, data) => {
+       if (err) return next(err);
+       const result = baServices.readProperty.decodeAcknowledge(data.buffer, data.offset, data.length);
+       if (!result) return next(new Error('INVALID_DECODING'));
+@@ -615,10 +648,10 @@ class Client extends EventEmitter {
+   writeProperty(address, objectId, propertyId, values, options, next) {
+     next = next || options;
+     const settings = {
+-      maxSegments: options.maxSegments || baEnum.MaxSegmentsAccepted.SEGMENTS_65,
+-      maxApdu: options.maxApdu || baEnum.MaxApduLengthAccepted.OCTETS_1476,
+-      invokeId: options.invokeId || this._getInvokeId(),
+-      arrayIndex: options.arrayIndex || baEnum.ASN1_ARRAY_ALL,
++      maxSegments: options.maxSegments ?? baEnum.MaxSegmentsAccepted.SEGMENTS_65,
++      maxApdu: options.maxApdu ?? baEnum.MaxApduLengthAccepted.OCTETS_1476,
++      invokeId: options.invokeId ?? this._getInvokeId(),
++      arrayIndex: options.arrayIndex ?? baEnum.ASN1_ARRAY_ALL,
+       priority: options.priority
+     };
+     const buffer = this._getBuffer();
+@@ -626,8 +659,7 @@ class Client extends EventEmitter {
+     baApdu.encodeConfirmedServiceRequest(buffer, baEnum.PduTypes.CONFIRMED_REQUEST, baEnum.ConfirmedServiceChoice.WRITE_PROPERTY, settings.maxSegments, settings.maxApdu, settings.invokeId, 0, 0);
+     baServices.writeProperty.encode(buffer, objectId.type, objectId.instance, propertyId, settings.arrayIndex, settings.priority, values);
+     baBvlc.encode(buffer.buffer, baEnum.BvlcResultPurpose.ORIGINAL_UNICAST_NPDU, buffer.offset);
+-    this._transport.send(buffer.buffer, buffer.offset, address);
+-    this._addCallback(settings.invokeId, (err) => next(err));
++    this._sendRequest(buffer, address, settings.invokeId, baEnum.ConfirmedServiceChoice.WRITE_PROPERTY, (err) => next(err));
+   }
+ 
+   /**
+@@ -659,9 +691,9 @@ class Client extends EventEmitter {
+   readPropertyMultiple(address, propertiesArray, options, next) {
+     next = next || options;
+     const settings = {
+-      maxSegments: options.maxSegments || baEnum.MaxSegmentsAccepted.SEGMENTS_65,
+-      maxApdu: options.maxApdu || baEnum.MaxApduLengthAccepted.OCTETS_1476,
+-      invokeId: options.invokeId || this._getInvokeId()
++      maxSegments: options.maxSegments ?? baEnum.MaxSegmentsAccepted.SEGMENTS_65,
++      maxApdu: options.maxApdu ?? baEnum.MaxApduLengthAccepted.OCTETS_1476,
++      invokeId: options.invokeId ?? this._getInvokeId()
+     };
+     const buffer = this._getBuffer();
+     baNpdu.encode(buffer, baEnum.NpduControlPriority.NORMAL_MESSAGE | baEnum.NpduControlBits.EXPECTING_REPLY, address, null, DEFAULT_HOP_COUNT, baEnum.NetworkLayerMessageType.WHO_IS_ROUTER_TO_NETWORK, 0);
+@@ -669,8 +701,7 @@ class Client extends EventEmitter {
+     baApdu.encodeConfirmedServiceRequest(buffer, type, baEnum.ConfirmedServiceChoice.READ_PROPERTY_MULTIPLE, settings.maxSegments, settings.maxApdu, settings.invokeId, 0, 0);
+     baServices.readPropertyMultiple.encode(buffer, propertiesArray);
+     baBvlc.encode(buffer.buffer, baEnum.BvlcResultPurpose.ORIGINAL_UNICAST_NPDU, buffer.offset);
+-    this._transport.send(buffer.buffer, buffer.offset, address);
+-    this._addCallback(settings.invokeId, (err, data) => {
++    this._sendRequest(buffer, address, settings.invokeId, baEnum.ConfirmedServiceChoice.READ_PROPERTY_MULTIPLE, (err, data) => {
+       if (err) return next(err);
+       const result = baServices.readPropertyMultiple.decodeAcknowledge(data.buffer, data.offset, data.length);
+       if (!result) return next(new Error('INVALID_DECODING'));
+@@ -1383,7 +1414,15 @@ class Client extends EventEmitter {
+    * client.close();
+    */
+   close() {
+-    this._transport.close();
++    if (this._closed) return this._closePromise;
++    this._closed = true;
++    for (const id of this._invokeStore.keys()) this._finishRequest(id, new Error('BACnet client is closed'));
++    for (const key of this._segmentStore.keys()) this._removeSegments(key);
++    this._transport.removeListener('message', this._onTransportMessage);
++    this._closePromise = Promise.resolve().then(() => this._transport.close()).finally(() => {
++      this._transport.removeListener('error', this._onTransportError);
++    });
++    return this._closePromise;
+   }
+ }
+ module.exports = Client;
+diff --git a/node_modules/bacstack/lib/services/read-property.js b/node_modules/bacstack/lib/services/read-property.js
+index c427b7a..48b1d69 100644
+--- a/node_modules/bacstack/lib/services/read-property.js
++++ b/node_modules/bacstack/lib/services/read-property.js
+@@ -11,7 +11,7 @@ module.exports.encode = (buffer, objectType, objectInstance, propertyId, arrayIn
+     baAsn1.encodeContextEnumerated(buffer, 1, propertyId);
+   }
+   if (arrayIndex !== baEnum.ASN1_ARRAY_ALL) {
+-    baAsn1.encodeContextUnsigned(buffer, 2, arrayIndex || baEnum.ASN1_ARRAY_ALL);
++    baAsn1.encodeContextUnsigned(buffer, 2, arrayIndex ?? baEnum.ASN1_ARRAY_ALL);
+   }
+ };
+ 
+diff --git a/node_modules/bacstack/lib/services/write-property.js b/node_modules/bacstack/lib/services/write-property.js
+index 5da9de5..e9472eb 100644
+--- a/node_modules/bacstack/lib/services/write-property.js
++++ b/node_modules/bacstack/lib/services/write-property.js
+@@ -14,7 +14,7 @@ module.exports.encode = (buffer, objectType, objectInstance, propertyId, arrayIn
+     baAsn1.bacappEncodeApplicationData(buffer, value);
+   });
+   baAsn1.encodeClosingTag(buffer, 3);
+-  if (priority !== baEnum.ASN1_NO_PRIORITY) {
++  if (priority != null && priority !== baEnum.ASN1_NO_PRIORITY) {
+     baAsn1.encodeContextUnsigned(buffer, 4, priority);
+   }
+ };
+@@ -68,7 +68,7 @@ module.exports.decode = (buffer, offset, apduLen) => {
+     if (result.tagNumber === 4) {
+       len += result.len;
+       decodedValue = baAsn1.decodeUnsigned(buffer, offset + len, result.value);
+-      len += decodedValue;
++      len += decodedValue.len;
+       if ((decodedValue.value >= baEnum.ASN1_MIN_PRIORITY) && (decodedValue.value <= baEnum.ASN1_MAX_PRIORITY)) {
+         value.priority = decodedValue.value;
+       } else {
+diff --git a/node_modules/bacstack/lib/transport.js b/node_modules/bacstack/lib/transport.js
+index 8827172..32888cb 100644
+--- a/node_modules/bacstack/lib/transport.js
++++ b/node_modules/bacstack/lib/transport.js
+@@ -9,7 +9,7 @@ class Transport extends EventEmitter {
+     this._settings = settings;
+     this._server = createSocket({type: 'udp4', reuseAddr: true});
+     this._server.on('message', (msg, rinfo) => this.emit('message', msg, rinfo.address));
+-    this._server.on('error', (err) => this.emit('message', err));
++    this._server.on('error', (err) => this.emit('error', err));
+   }
+ 
+   getBroadcastAddress() {
+@@ -26,12 +26,20 @@ class Transport extends EventEmitter {
+ 
+   open() {
+     this._server.bind(this._settings.port, this._settings.interface, () => {
+-      this._server.setBroadcast(true);
++      if (!this._closing) this._server.setBroadcast(true);
+     });
+   }
+ 
+   close() {
+-    this._server.close();
++    this._closing = true;
++    return new Promise((resolve, reject) => {
++      try {
++        this._server.close(resolve);
++      } catch (error) {
++        if (error.code === 'ERR_SOCKET_DGRAM_NOT_RUNNING') resolve();
++        else reject(error);
++      }
++    });
+   }
+ }
+ module.exports = Transport;

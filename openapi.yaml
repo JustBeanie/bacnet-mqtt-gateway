@@ -278,8 +278,8 @@ paths:
                       type: string
                     deviceId:
                       type: integer
-        '500':
-          description: Internal server error.
+        '503':
+          description: BACnet discovery is unavailable or the gateway is shutting down.
           content:
             application/json:
               schema:
@@ -295,6 +295,12 @@ paths:
           description: The ID of the BACnet device to scan (must match a configured deviceId or one from discovery).
           schema:
             type: string
+        - name: saveConfig
+          in: query
+          description: Persist the discovered objects for polling. Requires an administrator.
+          schema:
+            type: boolean
+            default: false
       requestBody:
         description: Device information, typically its IP address and BACnet deviceId.
         required: true
@@ -317,14 +323,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Device not found or not responding.
+        '403':
+          description: Saving a device configuration requires an administrator.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: BACnet request capacity is exhausted or the gateway is shutting down.
           content:
             application/json:
               schema:
@@ -453,6 +465,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '500':
           description: BACnet write operation failed or internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: The request cannot run because capacity is exhausted, the device configuration changed, or the gateway is shutting down.
           content:
             application/json:
               schema:

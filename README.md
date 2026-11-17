@@ -53,6 +53,12 @@ npm run test:coverage
 
 Jest coverage thresholds are enforced in `package.json`.
 
+The runtime database keeps up to seven days and 100,000 rows of poll history.
+Latest device and object state is stored separately.
+
+After a local image build, run `sh test-fixtures/docker_smoke.sh "$PWD" IMAGE`
+to check Supervisor startup, MQTT reconnection, and retained availability after shutdown.
+
 Install and configuration documentation for Home Assistant users lives in the
-app's `DOCS.md` in the `ha-addons` repository. Upstream's own documentation is
-kept verbatim in [`UPSTREAM.md`](UPSTREAM.md).
+app's `DOCS.md` in the `ha-addons` repository. See [`UPSTREAM.md`](UPSTREAM.md)
+for upstream documentation.
