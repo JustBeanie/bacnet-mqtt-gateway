@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.4
+
+- Rate-limit requests for bundled console assets with a separate budget for
+  each client. This resolves CodeQL alerts #1 and #2.
+
 ## 2.0.3
 
 - Make configuration saves atomic and discard poll results from superseded

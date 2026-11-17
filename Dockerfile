@@ -1,6 +1,6 @@
 FROM ghcr.io/home-assistant/base:3.24
 
-ARG BUILD_VERSION=2.0.3
+ARG BUILD_VERSION=2.0.4
 ARG BUILD_ARCH
 
 ENV NODE_ENV=production \
